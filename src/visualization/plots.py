@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 import numpy as np
 import pandas as pd
 from joblib import load
@@ -213,5 +214,73 @@ def plot_warehouse_overview(db_path: str = WAREHOUSE_DB_PATH, out_dir: str = FIG
     return {
         "n_months": int(len(flotation)),
         "n_procurement_categories": int(len(procurement)),
+        "figure_path": out_path,
+    }
+
+
+def plot_warehouse_overview_animated(db_path: str = WAREHOUSE_DB_PATH, out_dir: str = FIGURES_DIR) -> dict:
+    """Animated 'racing line chart' GIF of the monthly flotation recovery
+    trend, built from the exact same query as plot_warehouse_overview(). The
+    static PNG remains the primary artifact -- this is a companion GIF for
+    visual impact, saved via the Pillow writer (no ffmpeg dependency).
+    """
+    con = _connect(db_path)
+    try:
+        flotation = con.execute(
+            """
+            SELECT month, AVG(recovery_pct) AS avg_recovery_pct, AVG(feed_grade_pct) AS avg_feed_grade_pct
+            FROM flotation_batches GROUP BY month ORDER BY month
+            """
+        ).fetchdf()
+    finally:
+        con.close()
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    months = flotation["month"].tolist()
+    values = flotation["avg_recovery_pct"].to_numpy()
+    n_points = len(values)
+
+    # Subsample real data points into ~30-60 animation frames (no fabrication).
+    n_frames = min(45, n_points) if n_points > 1 else 1
+    frame_indices = sorted(set(np.linspace(0, n_points - 1, n_frames).round().astype(int).tolist()))
+
+    with plt.style.context("dark_background"):
+        fig, ax = plt.subplots(figsize=(12, 6))
+        line, = ax.plot([], [], color="#3ddc84", linewidth=2.5, marker="o", markersize=5)
+        label = ax.annotate(
+            "", xy=(0, 0), xytext=(15, 15), textcoords="offset points",
+            fontsize=11, color="white", fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.4", fc="#1f1f1f", ec="#3ddc84", lw=1.2),
+        )
+
+        ax.set_xlim(-0.5, n_points - 0.5)
+        pad = (values.max() - values.min()) * 0.15 + 0.5
+        ax.set_ylim(values.min() - pad, values.max() + pad)
+        ax.set_xticks(range(n_points))
+        ax.set_xticklabels(months, rotation=45, ha="right", fontsize=8)
+        ax.set_ylabel("Avg. recovery (%)", fontsize=10)
+        ax.set_title("Flotation recovery by month (animated)", fontsize=13, fontweight="bold", loc="left")
+        ax.grid(color="#444444", linewidth=0.6, alpha=0.6)
+        fig.tight_layout()
+
+        def update(frame_idx):
+            i = frame_indices[frame_idx]
+            x = list(range(i + 1))
+            y = values[: i + 1]
+            line.set_data(x, y)
+            label.xy = (i, values[i])
+            label.set_text(f"Recovery: {values[i]:.1f}%  ({months[i]})")
+            return line, label
+
+        ani = FuncAnimation(fig, update, frames=len(frame_indices), interval=150, blit=False, repeat=True)
+
+        out_path = os.path.join(out_dir, "warehouse_overview_animated.gif")
+        ani.save(out_path, writer="pillow", fps=7)
+        plt.close(fig)
+
+    return {
+        "n_months": int(len(flotation)),
+        "n_frames": len(frame_indices),
         "figure_path": out_path,
     }

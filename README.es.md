@@ -66,7 +66,10 @@ Tres paneles, todos sobre el mismo test held-out (n=400): la curva ROC (izquierd
 
 ### `get_flotation_summary` / `get_procurement_summary` — el trasfondo operacional
 
+![Resumen del warehouse animado](reports/figures/warehouse_overview_animated.gif)
 ![Resumen del warehouse](reports/figures/warehouse_overview.png)
+
+El GIF de arriba anima la tendencia de recuperación de flotación a lo largo de los 12 meses; el PNG de abajo es la referencia estática para lectura detallada.
 
 Izquierda: recuperación promedio mensual de flotación sobre la ventana sintética de 12 meses — oscila en una banda relativamente estrecha de 87–89,5%, con una caída visible a 86,7% en abril de 2026 antes de recuperarse a un máximo de 12 meses de 89,4% en agosto de 2026. Derecha: gasto de procurement por categoría, ordenado `services` > `fuel` > `safety_equipment` > `reagents` > `spare_parts` — `services` y `fuel` juntos representan cerca del 45% del gasto total de procurement en este warehouse sintético, por delante de consumibles como reactivos y repuestos.
 

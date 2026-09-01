@@ -13,6 +13,7 @@ from src.visualization.plots import (
     plot_anomaly_scores,
     plot_credit_risk_evaluation,
     plot_warehouse_overview,
+    plot_warehouse_overview_animated,
 )
 
 REPORTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "reports")
@@ -22,6 +23,7 @@ def main() -> dict:
     credit_risk = plot_credit_risk_evaluation()
     anomalies = plot_anomaly_scores()
     warehouse = plot_warehouse_overview()
+    plot_warehouse_overview_animated()
 
     summary = {
         "credit_risk_tool": {

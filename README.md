@@ -66,7 +66,10 @@ Three panels, all from the same held-out test set (n=400): the ROC curve (left) 
 
 ### `get_flotation_summary` / `get_procurement_summary` — the operational backdrop
 
+![Warehouse overview animated](reports/figures/warehouse_overview_animated.gif)
 ![Warehouse overview](reports/figures/warehouse_overview.png)
+
+The GIF above animates the flotation recovery trend across the 12 months; the PNG below is the static reference for detailed reading.
 
 Left: monthly average flotation recovery over the synthetic 12-month window — it oscillates in a fairly tight 87–89.5% band, with a visible dip to 86.7% in April 2026 before recovering to a 12-month high of 89.4% in August 2026. Right: procurement spend by category, ranked `services` > `fuel` > `safety_equipment` > `reagents` > `spare_parts` — `services` and `fuel` alone account for roughly 45% of total procurement spend in this synthetic warehouse, ahead of consumables like reagents and spare parts.
 
