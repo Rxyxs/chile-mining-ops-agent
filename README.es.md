@@ -52,11 +52,23 @@ Generados por `python -m src.generate_report` (`src/visualization/plots.py`), qu
 | `check_maintenance_anomalies` | Equipos marcados (ventana 60d) | 3 / 24 |
 | `get_flotation_summary` | Meses de datos | 12 |
 
-**Lectura honesta sobre el número de riesgo crediticio**: ROC-AUC 0,586 es débil — apenas por encima del baseline de 0,5 sin habilidad predictiva. Esto no se disimula: el generador de solicitantes sintéticos en `setup_data.py` mezcla una probabilidad de default latente bastante ruidosa con solo seis features y una `LogisticRegression` simple, así que un puntaje mediocre aquí es un reflejo preciso de un modelo de ejemplo deliberadamente simple, no un bug. El punto de este repo es la arquitectura de tool-calling, no exprimir AUC de un dataset de juguete.
+### `score_credit_risk` — débil pero honesto
 
 ![Evaluación de riesgo crediticio](reports/figures/credit_risk_evaluation.png)
+
+Tres paneles, todos sobre el mismo test held-out (n=400): la curva ROC (izquierda) se pega a la diagonal de "sin habilidad predictiva" — nunca se aleja mucho de ella, que es justo lo que se ve cuando se grafica un ROC-AUC de 0,586 en vez de solo reportar el número. La curva PR (centro) se dispara cerca de recall=0 (un puñado de predicciones de alta probabilidad, confiadas y correctas) y luego decae rápido hacia la tasa base de 0,245, el piso realista al aumentar el recall. El histograma (derecha) hace visible la razón: las distribuciones de probabilidad predicha para "default" y "no default" se solapan casi por completo — el modelo no puede separar limpiamente ambas clases porque, por diseño, `setup_data.py` genera la probabilidad de default latente a partir de una mezcla ruidosa de solo seis features, puntuada con una `LogisticRegression` simple. Esto no es un bug disimulado — es lo que se ve al evaluar honestamente un modelo de ejemplo deliberadamente simple, en vez de elegir una métrica que esconda el solapamiento.
+
+### `check_maintenance_anomalies` — el downtime no es toda la historia
+
 ![Scores de anomalía por equipo](reports/figures/anomaly_scores.png)
+
+3 de 24 equipos quedan marcados por el `IsolationForest`, y los marcados **no** son simplemente los tres con más downtime — esa es la parte interesante de este gráfico. EQ-007 tiene más downtime total (23,2h) que el marcado EQ-009 (22,6h) pero no queda marcado; EQ-023 queda marcado con un downtime medio de 10,4h, por debajo de varias barras normales; y EQ-024 queda marcado a pesar de tener casi nada de downtime (0,5h) — anómalo por ser inusualmente *bajo*, no alto. Es lo esperable de un Isolation Forest que corre sobre múltiples features del evento de mantenimiento (frecuencia, severidad, downtime) en vez de un umbral simple de downtime, y es una señal más realista que "marca la barra más alta".
+
+### `get_flotation_summary` / `get_procurement_summary` — el trasfondo operacional
+
 ![Resumen del warehouse](reports/figures/warehouse_overview.png)
+
+Izquierda: recuperación promedio mensual de flotación sobre la ventana sintética de 12 meses — oscila en una banda relativamente estrecha de 87–89,5%, con una caída visible a 86,7% en abril de 2026 antes de recuperarse a un máximo de 12 meses de 89,4% en agosto de 2026. Derecha: gasto de procurement por categoría, ordenado `services` > `fuel` > `safety_equipment` > `reagents` > `spare_parts` — `services` y `fuel` juntos representan cerca del 45% del gasto total de procurement en este warehouse sintético, por delante de consumibles como reactivos y repuestos.
 
 ## Instalación
 
