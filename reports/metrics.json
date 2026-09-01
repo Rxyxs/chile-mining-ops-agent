@@ -1,0 +1,18 @@
+{
+  "credit_risk_tool": {
+    "roc_auc": 0.5861,
+    "pr_auc": 0.3351,
+    "test_accuracy": 0.755,
+    "n_test": 400,
+    "base_rate": 0.245
+  },
+  "anomaly_check_tool": {
+    "window_days": 60,
+    "n_equipment_evaluated": 24,
+    "n_equipment_flagged": 3
+  },
+  "warehouse_query_tool": {
+    "n_months": 12,
+    "n_procurement_categories": 5
+  }
+}

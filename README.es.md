@@ -40,6 +40,24 @@ Las tres son funciones Python planas y síncronas, con un schema JSON asociado (
 
 El warehouse DuckDB tiene tres tablas sintéticas: `flotation_batches`, `maintenance_events`, `procurement_orders`, todas generadas por `src/setup_data.py` con `numpy.random.default_rng(42)`.
 
+## Resultados
+
+Generados por `python -m src.generate_report` (`src/visualization/plots.py`), que llama a las mismas funciones tool que despacha el agente en tiempo de ejecución y grafica sus resultados reales — nada aquí está hardcodeado ni re-simulado por separado de las tools.
+
+| Tool | Métrica | Valor |
+|---|---|---|
+| `score_credit_risk` | ROC-AUC (test held-out, n=400) | 0,586 |
+| `score_credit_risk` | PR-AUC (tasa base 0,245) | 0,335 |
+| `score_credit_risk` | Accuracy de test | 0,755 |
+| `check_maintenance_anomalies` | Equipos marcados (ventana 60d) | 3 / 24 |
+| `get_flotation_summary` | Meses de datos | 12 |
+
+**Lectura honesta sobre el número de riesgo crediticio**: ROC-AUC 0,586 es débil — apenas por encima del baseline de 0,5 sin habilidad predictiva. Esto no se disimula: el generador de solicitantes sintéticos en `setup_data.py` mezcla una probabilidad de default latente bastante ruidosa con solo seis features y una `LogisticRegression` simple, así que un puntaje mediocre aquí es un reflejo preciso de un modelo de ejemplo deliberadamente simple, no un bug. El punto de este repo es la arquitectura de tool-calling, no exprimir AUC de un dataset de juguete.
+
+![Evaluación de riesgo crediticio](reports/figures/credit_risk_evaluation.png)
+![Scores de anomalía por equipo](reports/figures/anomaly_scores.png)
+![Resumen del warehouse](reports/figures/warehouse_overview.png)
+
 ## Instalación
 
 ```bash
@@ -58,13 +76,21 @@ pip install -r requirements.txt
 
    Escribe `data/ops.duckdb` y `data/credit_risk_model.joblib`.
 
-2. **Correr la suite de tests** (funciona completamente offline, sin API key):
+2. **Generar las figuras de resultados y el resumen de métricas:**
+
+   ```bash
+   python -m src.generate_report
+   ```
+
+   Escribe `reports/figures/*.png` y `reports/metrics.json`.
+
+3. **Correr la suite de tests** (funciona completamente offline, sin API key):
 
    ```bash
    pytest
    ```
 
-3. **Hablar con el agente** (requiere una `ANTHROPIC_API_KEY` real):
+4. **Hablar con el agente** (requiere una `ANTHROPIC_API_KEY` real):
 
    ```bash
    python -m src.cli "¿Cuál fue la recuperación de flotación en septiembre de 2025?"
@@ -78,7 +104,8 @@ En el entorno de build de este proyecto **no hay `ANTHROPIC_API_KEY` disponible*
 
 **Verificado en esta sesión:**
 - `python -m src.setup_data` corre exitosamente y escribe ambos artefactos (la precisión de holdout del modelo de riesgo se imprimió y se observó, no se asumió).
-- `pytest` — **18/18 tests pasando**. Incluye ejecuciones reales de las cinco funciones tool contra el DuckDB y el modelo generados (sin mockear las tools mismas), más tests del loop del agente que mockean el cliente de Anthropic (`unittest.mock`) para verificar que el dispatcher llama a la tool correcta con los argumentos correctos, arma bien los bloques `tool_result`, maneja excepciones de las tools sin crashear, y respeta el tope de iteraciones.
+- `python -m src.generate_report` corre exitosamente y escribe las tres figuras más `reports/metrics.json` de arriba, a partir de resultados reales de las tools.
+- `pytest` — **22/22 tests pasando**. Incluye ejecuciones reales de las cinco funciones tool contra el DuckDB y el modelo generados (sin mockear las tools mismas), las tres funciones de graficado (verificando que las figuras se escriben de verdad a disco con contenido real), el script de reporte, más tests del loop del agente que mockean el cliente de Anthropic (`unittest.mock`) para verificar que el dispatcher llama a la tool correcta con los argumentos correctos, arma bien los bloques `tool_result`, maneja excepciones de las tools sin crashear, y respeta el tope de iteraciones.
 - Cada función tool también se invocó una vez manualmente fuera de pytest y devolvió un resultado real, inspeccionado.
 
 **No verificado:**
@@ -86,7 +113,7 @@ En el entorno de build de este proyecto **no hay `ANTHROPIC_API_KEY` disponible*
 
 ## Decisión de diseño: versionar los datos generados
 
-`data/ops.duckdb` y `data/credit_risk_model.joblib` se versionan en el repo en vez de ignorarse. Son pequeños, totalmente sintéticos, regenerables de forma determinística (`python -m src.setup_data`), y versionarlos permite que las tools funcionen inmediatamente después de clonar el repo sin un paso de setup obligatorio. El `.gitignore` sigue excluyendo el entorno virtual y las cachés.
+`data/ops.duckdb`, `data/credit_risk_model.joblib`, y `reports/figures/*.png` + `reports/metrics.json` se versionan en el repo en vez de ignorarse. Son pequeños, sintéticos/derivados, regenerables de forma determinística (`python -m src.setup_data && python -m src.generate_report`), y versionarlos permite que las tools (y los resultados de arriba) sean visibles inmediatamente después de clonar el repo sin un paso de setup obligatorio. El `.gitignore` sigue excluyendo el entorno virtual y las cachés.
 
 ## Autor
 

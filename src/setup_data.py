@@ -169,7 +169,12 @@ FEATURE_COLUMNS = [
 
 
 def train_credit_risk_model(model_path: str = RISK_MODEL_PATH, seed: int = RANDOM_SEED):
-    """Trains a small, self-contained LogisticRegression risk-scoring model."""
+    """Trains a small, self-contained LogisticRegression risk-scoring model.
+
+    Also persists the held-out test set and its predicted probabilities inside
+    the same joblib bundle, so the evaluation plots (ROC/PR/score distribution)
+    are generated from real held-out predictions rather than re-simulated data.
+    """
     rng = np.random.default_rng(seed + 1)
     df = _generate_credit_applicants(rng)
     X = df[FEATURE_COLUMNS]
@@ -180,9 +185,20 @@ def train_credit_risk_model(model_path: str = RISK_MODEL_PATH, seed: int = RANDO
     model = LogisticRegression(max_iter=1000)
     model.fit(X_train, y_train)
     test_accuracy = model.score(X_test, y_test)
+    y_proba_test = model.predict_proba(X_test)[:, 1]
 
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    dump({"model": model, "feature_columns": FEATURE_COLUMNS}, model_path)
+    dump(
+        {
+            "model": model,
+            "feature_columns": FEATURE_COLUMNS,
+            "test_accuracy": test_accuracy,
+            "X_test": X_test.reset_index(drop=True),
+            "y_test": y_test.reset_index(drop=True),
+            "y_proba_test": y_proba_test,
+        },
+        model_path,
+    )
     return model, test_accuracy
 
 
