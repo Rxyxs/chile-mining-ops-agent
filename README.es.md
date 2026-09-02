@@ -4,11 +4,11 @@
 
 ## Resumen
 
-Las operaciones mineras y de riesgo en Chile suelen consultarse a través de dashboards fijos: una pantalla para KPIs de flotación, otra para alertas de mantenimiento, otra para un modelo de riesgo crediticio. Este proyecto explora una interfaz distinta: un agente en lenguaje natural que responde preguntas operacionales y de riesgo **llamando herramientas reales** (funciones Python que consultan una base de datos real y un modelo real ya entrenado), sin inventar números.
+Construí esto después de notar lo frágil que es un dashboard fijo para el tipo de pregunta que la gente realmente hace sobre una operación minera. Un dashboard responde exactamente las preguntas para las que sus pantallas fueron diseñadas — la recuperación de flotación de este mes, las alertas de mantenimiento de esta semana, el score de riesgo de este solicitante — pero apenas alguien pregunta algo un poco distinto ("¿la recuperación de septiembre fue normal, y algún equipo con mucho downtime también está marcado como anómalo?"), o hace falta una pantalla nueva o alguien corre una consulta ad hoc a mano. Ninguna de las dos opciones escala, y la segunda es justo donde los números se recuerdan mal o se estiman bajo presión de tiempo.
 
-Es el proyecto #37 de un portafolio construido mayormente sobre modelos tabulares/series de tiempo (baseline + ensamble + PyTorch, comparados entre sí). Ninguno de esos proyectos ejercita tool-calling real con un LLM — este cierra ese hueco.
+Lo que quise probar acá es si un loop de tool-calling con un LLM da algo mejor que ambas opciones: una interfaz en lenguaje natural que pueda responder un rango más amplio de preguntas ad hoc que cualquier dashboard fijo, pero manteniéndose **anclada a datos reales** — cada número en su respuesta tiene que venir de una llamada a una tool real (una consulta DuckDB real, una predicción de modelo real), no de lo que el modelo adivine que sonaría plausible. Ese es todo el punto de enrutar a través de `tools=[...]` en la API de Anthropic en vez de simplemente pedirle al modelo que responda desde contexto: el modelo puede pedir una tool, pero no puede inventar un `tool_result`.
 
-Todo lo que las herramientas tocan — los datos operacionales y el modelo de riesgo crediticio — es **sintético y generado dentro de este mismo repo**, con semilla fija. No se copia ni se importa nada de otros repositorios del portafolio; la arquitectura se inspira en patrones usados en otros lados (ej. un warehouse DuckDB, un modelo de regresión logística de riesgo) pero los artefactos son autocontenidos y se construyen desde cero aquí.
+Todo lo que las herramientas tocan — los datos operacionales y el modelo de riesgo crediticio — es **sintético y generado dentro de este mismo repo**, con semilla fija (`numpy.random.default_rng(42)`), así que todo el pipeline (schema, datos, modelo, tools, tests) es reproducible desde un clone limpio con `python -m src.setup_data`.
 
 ## Arquitectura
 
@@ -40,6 +40,17 @@ Las tres son funciones Python planas y síncronas, con un schema JSON asociado (
 
 El warehouse DuckDB tiene tres tablas sintéticas: `flotation_batches`, `maintenance_events`, `procurement_orders`, todas generadas por `src/setup_data.py` con `numpy.random.default_rng(42)`.
 
+## Técnicas usadas
+
+| Técnica | Dónde | Para qué sirve |
+|---|---|---|
+| API de tool-use de Anthropic (SDK Python `anthropic`, `messages.create(tools=...)`) | `src/cli.py` | Deja que el modelo decida *qué* tool llamar y con *qué* argumentos, en vez de matching de intención hardcodeado. |
+| Loop de agente acotado (`MiningOpsAgent.run`) | `src/agent.py` | Despacha bloques `tool_use` a funciones Python reales, devuelve los `tool_result` al modelo, y limita las iteraciones (5 por defecto) para que un modelo trabado no entre en loop infinito. |
+| DuckDB, consultas parametrizadas | `src/tools/warehouse_query_tool.py` | Consultas OLAP locales rápidas sobre el warehouse operacional sintético; los parámetros se bindean (placeholders `?`), nunca SQL armado por interpolación de strings. |
+| `LogisticRegression` (scikit-learn) | `src/tools/credit_risk_tool.py`, `src/setup_data.py` | Un modelo de riesgo crediticio pequeño y autocontenido, entrenado sobre datos sintéticos de solicitantes; devuelve una probabilidad de default y un tier de riesgo. |
+| `IsolationForest` (scikit-learn) | `src/tools/anomaly_check_tool.py` | Detección de outliers no supervisada sobre features de mantenimiento por equipo (cantidad de eventos, downtime total, proporción de eventos críticos/altos) para marcar equipos anómalos sin un umbral fijado a mano. |
+| Cliente Anthropic falso con `unittest.mock` | `tests/test_agent.py` | Verifica la lógica de ruteo del dispatcher (tool correcta, argumentos correctos, forma correcta del `tool_result`, manejo de errores, tope de iteraciones) sin ninguna llamada real a la API. |
+
 ## Resultados
 
 Generados por `python -m src.generate_report` (`src/visualization/plots.py`), que llama a las mismas funciones tool que despacha el agente en tiempo de ejecución y grafica sus resultados reales — nada aquí está hardcodeado ni re-simulado por separado de las tools.
@@ -58,6 +69,17 @@ Generados por `python -m src.generate_report` (`src/visualization/plots.py`), qu
 
 Tres paneles, todos sobre el mismo test held-out (n=400): la curva ROC (izquierda) se pega a la diagonal de "sin habilidad predictiva" — nunca se aleja mucho de ella, que es justo lo que se ve cuando se grafica un ROC-AUC de 0,586 en vez de solo reportar el número. La curva PR (centro) se dispara cerca de recall=0 (un puñado de predicciones de alta probabilidad, confiadas y correctas) y luego decae rápido hacia la tasa base de 0,245, el piso realista al aumentar el recall. El histograma (derecha) hace visible la razón: las distribuciones de probabilidad predicha para "default" y "no default" se solapan casi por completo — el modelo no puede separar limpiamente ambas clases porque, por diseño, `setup_data.py` genera la probabilidad de default latente a partir de una mezcla ruidosa de solo seis features, puntuada con una `LogisticRegression` simple. Esto no es un bug disimulado — es lo que se ve al evaluar honestamente un modelo de ejemplo deliberadamente simple, en vez de elegir una métrica que esconda el solapamiento.
 
+**Versión interactiva:** [P(default) predicha vs. debt-to-income, los 400 solicitantes held-out, hover para ver el perfil completo](https://htmlpreview.github.io/?https://github.com/Rxyxs/chile-mining-ops-agent/blob/main/outputs/interactive/credit_risk_scores.html) — abre un gráfico Plotly interactivo en vivo (HTML autocontenido, generado por `plot_credit_risk_interactive()` en `src/visualization/plots.py`) en vez de una imagen estática.
+
+**Dos perfiles reales de solicitante puntuados con `score_credit_risk` (llamado directamente, sin LLM en el loop):**
+
+| Perfil | Edad | Ingreso (CLP/mes) | Debt-to-income | Meses empleado | Pagos atrasados | Solicitado (CLP) | `probability_default` | `risk_tier` |
+|---|---|---|---|---|---|---|---|---|
+| Ejemplo bajo riesgo | 42 | 1.400.000 | 0,15 | 96 | 0 | 1.500.000 | **0,0823** | **low** |
+| Ejemplo alto riesgo | 24 | 380.000 | 0,92 | 3 | 6 | 5.500.000 | **0,7892** | **critical** |
+
+Ambas filas son una llamada real a `score_credit_risk(...)` cada una, corridas en esta sesión contra el modelo versionado en `data/credit_risk_model.joblib` — no elegidas a mano para verse limpias, solo dos perfiles en extremos opuestos de los rangos de entrada con los que se entrenó el modelo.
+
 ### `check_maintenance_anomalies` — el downtime no es toda la historia
 
 ![Scores de anomalía por equipo](reports/figures/anomaly_scores.png)
@@ -72,6 +94,24 @@ Tres paneles, todos sobre el mismo test held-out (n=400): la curva ROC (izquierd
 El GIF de arriba anima la tendencia de recuperación de flotación a lo largo de los 12 meses; el PNG de abajo es la referencia estática para lectura detallada.
 
 Izquierda: recuperación promedio mensual de flotación sobre la ventana sintética de 12 meses — oscila en una banda relativamente estrecha de 87–89,5%, con una caída visible a 86,7% en abril de 2026 antes de recuperarse a un máximo de 12 meses de 89,4% en agosto de 2026. Derecha: gasto de procurement por categoría, ordenado `services` > `fuel` > `safety_equipment` > `reagents` > `spare_parts` — `services` y `fuel` juntos representan cerca del 45% del gasto total de procurement en este warehouse sintético, por delante de consumibles como reactivos y repuestos.
+
+**Tres llamadas más a las tools de warehouse, corridas directamente en esta sesión (sin LLM de por medio):**
+
+```text
+>>> get_flotation_summary("2025-09")
+{'n_batches': 18, 'avg_feed_grade_pct': 0.83, 'avg_recovery_pct': 88.87,
+ 'avg_concentrate_grade_pct': 28.28, 'total_tonnage_processed': 26282.7, 'month': '2025-09'}
+
+>>> get_procurement_summary("delayed")
+{'status_filter': 'delayed', 'n_orders': 66, 'total_amount_usd': 514709.88, 'avg_amount_usd': 7798.63}
+
+>>> check_maintenance_anomalies(days=60)
+{'window_days': 60, 'n_equipment_evaluated': 24, 'n_equipment_flagged': 3,
+ 'flagged': [
+   {'equipment_id': 'EQ-009', 'n_events': 7, 'total_downtime_hours': 22.53, 'critical_share': 0.286, 'anomaly_score': -0.0365},
+   {'equipment_id': 'EQ-024', 'n_events': 2, 'total_downtime_hours': 0.6,  'critical_share': 0.5,   'anomaly_score': -0.0174},
+   {'equipment_id': 'EQ-023', 'n_events': 3, 'total_downtime_hours': 10.46, 'critical_share': 0.667, 'anomaly_score': -0.007}]}
+```
 
 ## Instalación
 
@@ -97,7 +137,7 @@ pip install -r requirements.txt
    python -m src.generate_report
    ```
 
-   Escribe `reports/figures/*.png` y `reports/metrics.json`.
+   Escribe `reports/figures/*.png`, `reports/figures/*.gif`, `reports/metrics.json`, y `outputs/interactive/credit_risk_scores.html`.
 
 3. **Correr la suite de tests** (funciona completamente offline, sin API key):
 
@@ -115,20 +155,20 @@ pip install -r requirements.txt
 
 ## Nota honesta sobre lo verificado
 
-En el entorno de build de este proyecto **no hay `ANTHROPIC_API_KEY` disponible**. Eso limita lo que efectivamente se pudo correr y confirmar aquí, y esta sección reporta solo lo que se ejecutó en esta sesión — nada se describe como funcionando si no se corrió de verdad.
+En el entorno de build de este proyecto **no hay `ANTHROPIC_API_KEY` disponible**, ni en la creación original ni en esta revisión. Eso limita lo que efectivamente se pudo correr y confirmar aquí, y esta sección reporta solo lo que se ejecutó en esta sesión — nada se describe como funcionando si no se corrió de verdad.
 
-**Verificado en esta sesión:**
-- `python -m src.setup_data` corre exitosamente y escribe ambos artefactos (la precisión de holdout del modelo de riesgo se imprimió y se observó, no se asumió).
-- `python -m src.generate_report` corre exitosamente y escribe las tres figuras más `reports/metrics.json` de arriba, a partir de resultados reales de las tools.
-- `pytest` — **22/22 tests pasando**. Incluye ejecuciones reales de las cinco funciones tool contra el DuckDB y el modelo generados (sin mockear las tools mismas), las tres funciones de graficado (verificando que las figuras se escriben de verdad a disco con contenido real), el script de reporte, más tests del loop del agente que mockean el cliente de Anthropic (`unittest.mock`) para verificar que el dispatcher llama a la tool correcta con los argumentos correctos, arma bien los bloques `tool_result`, maneja excepciones de las tools sin crashear, y respeta el tope de iteraciones.
-- Cada función tool también se invocó una vez manualmente fuera de pytest y devolvió un resultado real, inspeccionado.
+**Verificado en esta sesión (clone limpio, virtualenv limpio, comandos reales, output real capturado):**
+- `python -m src.setup_data` corre exitosamente y escribe ambos artefactos (precisión de holdout `0,755` impresa y observada, no asumida).
+- `python -m src.generate_report` corre exitosamente y escribe las cuatro figuras (`credit_risk_evaluation.png`, `anomaly_scores.png`, `warehouse_overview.png`, `warehouse_overview_animated.gif`) más `reports/metrics.json` y `outputs/interactive/credit_risk_scores.html`, todo a partir de resultados reales de las tools/el modelo.
+- `pytest` — **23/23 tests pasando**. Incluye ejecuciones reales de las cinco funciones tool contra el DuckDB y el modelo generados (sin mockear las tools mismas), las cuatro funciones de graficado (verificando que las figuras/el HTML se escriben de verdad a disco con contenido real), el script de reporte, más tests del loop del agente que mockean el cliente de Anthropic (`unittest.mock`) para verificar que el dispatcher llama a la tool correcta con los argumentos correctos, arma bien los bloques `tool_result`, maneja excepciones de las tools sin crashear, y respeta el tope de iteraciones.
+- Cada función tool también se invocó manualmente fuera de pytest — las consultas de warehouse, los dos perfiles de riesgo crediticio, y el chequeo de anomalías de arriba son output real copiado, no parafraseado.
 
 **No verificado:**
-- Una conversación real end-to-end contra la API real de Anthropic. `src/cli.py` está escrito para hacer esa llamada de verdad (`anthropic.Anthropic()`, modelo `claude-sonnet-5` por defecto), pero nunca se corrió en este entorno porque no hay API key disponible. Cualquiera que clone este repo con su propia `ANTHROPIC_API_KEY` puede correr `python -m src.cli "..."` para probarlo en vivo — ese camino está implementado y testeado a nivel de dispatch, solo que no se ejercitó contra la API real aquí.
+- Una conversación real end-to-end contra la API real de Anthropic. `src/cli.py` está escrito para hacer esa llamada de verdad (`anthropic.Anthropic()`, modelo `claude-sonnet-5` por defecto), pero nunca se corrió en este entorno porque no hay API key disponible. Cualquiera que clone este repo con su propia `ANTHROPIC_API_KEY` puede correr `python -m src.cli "..."` para probarlo en vivo — ese camino está implementado y testeado a nivel de dispatch (ver `tests/test_agent.py`, que ejercita el mismo loop `MiningOpsAgent.run()` con un cliente falso en lugar de la API real), solo que no se ejercitó contra la API real aquí.
 
 ## Decisión de diseño: versionar los datos generados
 
-`data/ops.duckdb`, `data/credit_risk_model.joblib`, y `reports/figures/*.png` + `reports/metrics.json` se versionan en el repo en vez de ignorarse. Son pequeños, sintéticos/derivados, regenerables de forma determinística (`python -m src.setup_data && python -m src.generate_report`), y versionarlos permite que las tools (y los resultados de arriba) sean visibles inmediatamente después de clonar el repo sin un paso de setup obligatorio. El `.gitignore` sigue excluyendo el entorno virtual y las cachés.
+`data/ops.duckdb`, `data/credit_risk_model.joblib`, `reports/figures/*.png` + `reports/metrics.json`, y `outputs/interactive/credit_risk_scores.html` se versionan en el repo en vez de ignorarse. Son pequeños, sintéticos/derivados, regenerables de forma determinística (`python -m src.setup_data && python -m src.generate_report`), y versionarlos permite que las tools (y los resultados de arriba) sean visibles inmediatamente después de clonar el repo sin un paso de setup obligatorio. El `.gitignore` sigue excluyendo el entorno virtual y las cachés.
 
 ## Autor
 

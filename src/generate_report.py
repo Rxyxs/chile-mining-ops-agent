@@ -12,6 +12,7 @@ import os
 from src.visualization.plots import (
     plot_anomaly_scores,
     plot_credit_risk_evaluation,
+    plot_credit_risk_interactive,
     plot_warehouse_overview,
     plot_warehouse_overview_animated,
 )
@@ -24,6 +25,7 @@ def main() -> dict:
     anomalies = plot_anomaly_scores()
     warehouse = plot_warehouse_overview()
     plot_warehouse_overview_animated()
+    plot_credit_risk_interactive()
 
     summary = {
         "credit_risk_tool": {

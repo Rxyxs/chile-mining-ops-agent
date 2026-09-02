@@ -35,6 +35,12 @@ FIGURES_DIR = os.path.join(
     "figures",
 )
 
+INTERACTIVE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "outputs",
+    "interactive",
+)
+
 
 def _style_axes(ax):
     ax.set_facecolor(SURFACE)
@@ -112,6 +118,69 @@ def plot_credit_risk_evaluation(
         "base_rate": round(baseline, 4),
         "figure_path": out_path,
     }
+
+
+def plot_credit_risk_interactive(
+    model_path: str = RISK_MODEL_PATH, out_dir: str = INTERACTIVE_DIR
+) -> dict:
+    """Interactive Plotly scatter of the held-out test set: predicted
+    P(default) vs. debt-to-income, colored by the real outcome and with a
+    hover tooltip showing the applicant's other features. Same held-out
+    predictions as plot_credit_risk_evaluation() -- nothing re-simulated.
+    Saved as a single self-contained HTML file (inline plotly.js) so it
+    renders standalone, e.g. via htmlpreview.github.io.
+    """
+    import plotly.graph_objects as go
+
+    bundle = load(model_path)
+    X_test = bundle["X_test"]
+    y_test = np.asarray(bundle["y_test"])
+    y_proba = np.asarray(bundle["y_proba_test"])
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    fig = go.Figure()
+    for label, name, color in [(0, "no default (actual)", CAT["blue"]), (1, "default (actual)", CAT["red"])]:
+        mask = y_test == label
+        rows = X_test[mask]
+        hover = [
+            f"age={a}<br>income_clp={inc:,.0f}<br>debt_to_income={d:.2f}<br>"
+            f"months_employed={m:.0f}<br>late_payments={lp}<br>requested_clp={r:,.0f}<br>"
+            f"P(default)={p:.3f}"
+            for a, inc, d, m, lp, r, p in zip(
+                rows["age"], rows["monthly_income_clp"], rows["debt_to_income"],
+                rows["months_employed"], rows["n_late_payments"], rows["requested_amount_clp"],
+                y_proba[mask],
+            )
+        ]
+        fig.add_trace(
+            go.Scatter(
+                x=rows["debt_to_income"],
+                y=y_proba[mask],
+                mode="markers",
+                name=name,
+                marker=dict(color=color, size=8, opacity=0.7, line=dict(width=0.5, color="white")),
+                text=hover,
+                hoverinfo="text",
+            )
+        )
+
+    fig.update_layout(
+        title=f"Credit risk tool -- held-out test set (n={len(y_test)}): predicted P(default) vs. debt-to-income",
+        xaxis_title="Debt-to-income ratio",
+        yaxis_title="Predicted P(default)",
+        plot_bgcolor=SURFACE,
+        paper_bgcolor=SURFACE,
+        font=dict(color=INK_PRIMARY),
+        legend=dict(orientation="h", y=-0.15),
+        width=950,
+        height=560,
+    )
+
+    out_path = os.path.join(out_dir, "credit_risk_scores.html")
+    fig.write_html(out_path, include_plotlyjs="inline", full_html=True)
+
+    return {"n_test": int(len(y_test)), "figure_path": out_path}
 
 
 def plot_anomaly_scores(
