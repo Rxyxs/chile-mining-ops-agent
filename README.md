@@ -2,6 +2,8 @@
 
 *[Version en español: README.es.md](README.es.md)*
 
+[![tests](https://github.com/Rxyxs/chile-mining-ops-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/Rxyxs/chile-mining-ops-agent/actions/workflows/tests.yml)
+
 ## Overview
 
 I built this after noticing how brittle a fixed dashboard is for the kind of question people actually ask about a mining operation. A dashboard answers exactly the questions its screens were designed for — this month's flotation recovery, this week's maintenance alerts, this applicant's risk score — but the moment someone asks something slightly off that shape ("was September's recovery normal, and is any of the equipment that's been down a lot also flagged as anomalous?"), you either need a new screen or someone runs an ad hoc query by hand. Neither scales, and the second one is exactly where numbers get misremembered or fudged under time pressure.
@@ -160,7 +162,7 @@ There is **no `ANTHROPIC_API_KEY` in the build environment this project was crea
 **Verified in this session (fresh clone, fresh virtualenv, real commands, real output captured):**
 - `python -m src.setup_data` runs successfully and writes both artifacts (holdout accuracy `0.755` was printed and observed, not just assumed).
 - `python -m src.generate_report` runs successfully and writes all four figures (`credit_risk_evaluation.png`, `anomaly_scores.png`, `warehouse_overview.png`, `warehouse_overview_animated.gif`) plus `reports/metrics.json` and `outputs/interactive/credit_risk_scores.html`, all from real tool/model outputs.
-- `pytest` — **23/23 tests passing**. This includes real executions of all five tool functions against the generated DuckDB and model (no mocking of the tools themselves), the four plotting functions (asserting figures/HTML are actually written to disk with real content), the report script, plus agent-loop tests that mock the Anthropic client (`unittest.mock`) to verify the dispatcher calls the right tool with the right arguments, builds correct `tool_result` blocks, handles tool exceptions without crashing, and respects the max-iteration bound.
+- `pytest` — **23/23 tests passing**. This includes real executions of all five tool functions against the generated DuckDB and model (no mocking of the tools themselves), the four plotting functions (asserting figures/HTML are actually written to disk with real content), the report script, plus agent-loop tests that mock the Anthropic client (`unittest.mock`) to verify the dispatcher calls the right tool with the right arguments, builds correct `tool_result` blocks, handles tool exceptions without crashing, and respects the max-iteration bound. This suite now also runs in CI (see the badge at the top) on every push — it no longer depends on someone manually re-running it in a session to stay current.
 - Each tool function was also invoked manually outside pytest — the warehouse queries, both credit-risk profiles, and the anomaly check shown above are copy-pasted real output, not paraphrased.
 
 **Not verified:**

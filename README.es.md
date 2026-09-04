@@ -2,6 +2,8 @@
 
 *[English version: README.md](README.md)*
 
+[![tests](https://github.com/Rxyxs/chile-mining-ops-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/Rxyxs/chile-mining-ops-agent/actions/workflows/tests.yml)
+
 ## Resumen
 
 Construí esto después de notar lo frágil que es un dashboard fijo para el tipo de pregunta que la gente realmente hace sobre una operación minera. Un dashboard responde exactamente las preguntas para las que sus pantallas fueron diseñadas — la recuperación de flotación de este mes, las alertas de mantenimiento de esta semana, el score de riesgo de este solicitante — pero apenas alguien pregunta algo un poco distinto ("¿la recuperación de septiembre fue normal, y algún equipo con mucho downtime también está marcado como anómalo?"), o hace falta una pantalla nueva o alguien corre una consulta ad hoc a mano. Ninguna de las dos opciones escala, y la segunda es justo donde los números se recuerdan mal o se estiman bajo presión de tiempo.
@@ -160,7 +162,7 @@ En el entorno de build de este proyecto **no hay `ANTHROPIC_API_KEY` disponible*
 **Verificado en esta sesión (clone limpio, virtualenv limpio, comandos reales, output real capturado):**
 - `python -m src.setup_data` corre exitosamente y escribe ambos artefactos (precisión de holdout `0,755` impresa y observada, no asumida).
 - `python -m src.generate_report` corre exitosamente y escribe las cuatro figuras (`credit_risk_evaluation.png`, `anomaly_scores.png`, `warehouse_overview.png`, `warehouse_overview_animated.gif`) más `reports/metrics.json` y `outputs/interactive/credit_risk_scores.html`, todo a partir de resultados reales de las tools/el modelo.
-- `pytest` — **23/23 tests pasando**. Incluye ejecuciones reales de las cinco funciones tool contra el DuckDB y el modelo generados (sin mockear las tools mismas), las cuatro funciones de graficado (verificando que las figuras/el HTML se escriben de verdad a disco con contenido real), el script de reporte, más tests del loop del agente que mockean el cliente de Anthropic (`unittest.mock`) para verificar que el dispatcher llama a la tool correcta con los argumentos correctos, arma bien los bloques `tool_result`, maneja excepciones de las tools sin crashear, y respeta el tope de iteraciones.
+- `pytest` — **23/23 tests pasando**. Incluye ejecuciones reales de las cinco funciones tool contra el DuckDB y el modelo generados (sin mockear las tools mismas), las cuatro funciones de graficado (verificando que las figuras/el HTML se escriben de verdad a disco con contenido real), el script de reporte, más tests del loop del agente que mockean el cliente de Anthropic (`unittest.mock`) para verificar que el dispatcher llama a la tool correcta con los argumentos correctos, arma bien los bloques `tool_result`, maneja excepciones de las tools sin crashear, y respeta el tope de iteraciones. Esta suite ahora también corre en CI (ver el badge arriba) en cada push — ya no depende de que alguien la vuelva a correr manualmente en una sesión para que siga vigente.
 - Cada función tool también se invocó manualmente fuera de pytest — las consultas de warehouse, los dos perfiles de riesgo crediticio, y el chequeo de anomalías de arriba son output real copiado, no parafraseado.
 
 **No verificado:**
