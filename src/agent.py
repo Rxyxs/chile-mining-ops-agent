@@ -38,6 +38,22 @@ class MiningOpsAgent:
         self.model = model
         self.system_prompt = system_prompt
         self.max_iterations = max_iterations
+        self.history: list[dict] = []
+
+    def reset(self) -> None:
+        """Clears accumulated multi-turn conversation history. Does not affect
+        `run`, which never touches `self.history` in the first place."""
+        self.history = []
+
+    def chat(self, user_message: str) -> str:
+        """Runs one turn of an ongoing multi-turn conversation: unlike `run`,
+        this appends to and reads from `self.history`, so a follow-up question
+        can refer back to a prior answer or tool result (e.g. "and what about
+        August?") without the caller having to resend that context by hand."""
+        self.history.append({"role": "user", "content": user_message})
+        answer = self._run_loop(self.history)
+        self.history.append({"role": "assistant", "content": answer})
+        return answer
 
     def _execute_tool(self, name: str, tool_input: dict) -> dict:
         """Executes a registered tool function. Never raises -- exceptions are
@@ -51,10 +67,18 @@ class MiningOpsAgent:
             return {"error": f"{type(exc).__name__}: {exc}"}
 
     def run(self, user_message: str) -> str:
-        """Runs the tool-use loop for a single user message and returns the
-        model's final text response."""
+        """Runs the tool-use loop for a single, stateless message and returns
+        the model's final text response -- no memory of prior calls, and
+        `self.history` is left untouched. See `chat` for a multi-turn
+        conversation that remembers context across calls."""
         messages: list[dict] = [{"role": "user", "content": user_message}]
+        return self._run_loop(messages)
 
+    def _run_loop(self, messages: list[dict]) -> str:
+        """Shared tool-use loop: mutates `messages` in place as tool calls
+        happen (so a caller holding a reference, like `chat`'s `self.history`,
+        sees the intermediate tool_use/tool_result turns too) and returns the
+        model's final text answer."""
         for _ in range(self.max_iterations):
             response = self.client.messages.create(
                 model=self.model,

@@ -30,6 +30,8 @@ flowchart LR
 
 El loop vive en `src/agent.py` (`MiningOpsAgent`). Envía el mensaje del usuario y los schemas de las tools al modelo; si la respuesta pide `tool_use`, despacha a la función Python correspondiente, empaqueta el resultado (o la excepción, si la tool falló) como `tool_result`, y lo devuelve — con un tope de iteraciones (5 por defecto) para que un modelo que se comporte mal no entre en loop infinito.
 
+**Dos formas de usarlo:** `agent.run(pregunta)` es sin estado — una pregunta entra, una respuesta sale, sin memoria de nada antes o después. `agent.chat(pregunta)` es la versión multi-turno: agrega cada turno (incluyendo los intercambios intermedios de `tool_use`/`tool_result`) a `agent.history` y reenvía el historial creciente en cada llamada, así una pregunta de seguimiento como "¿y en agosto?" se resuelve contra la respuesta anterior sin que quien pregunta tenga que repetir el contexto. `agent.reset()` lo limpia. `src/cli.py` expone ambos modos: `python -m src.cli "pregunta"` para una sola pregunta, `python -m src.cli` (sin argumentos) para un REPL interactivo multi-turno.
+
 ## Herramientas expuestas (`src/tools/`)
 
 Las tres son funciones Python planas y síncronas, con un schema JSON asociado (`TOOL_SCHEMAS`) en el formato que espera la API de Anthropic para tool-use (`{"name", "description", "input_schema"}`). Cada una corre, y está testeada, **sin necesitar ningún LLM ni API key**.
@@ -52,11 +54,13 @@ El warehouse DuckDB tiene tres tablas sintéticas: `flotation_batches`, `mainten
 | `LogisticRegression` (scikit-learn) | `src/tools/credit_risk_tool.py`, `src/setup_data.py` | Un modelo de riesgo crediticio pequeño y autocontenido, entrenado sobre datos sintéticos de solicitantes; devuelve una probabilidad de default y un tier de riesgo. |
 | `IsolationForest` (scikit-learn) | `src/tools/anomaly_check_tool.py` | Detección de outliers no supervisada sobre features de mantenimiento por equipo (cantidad de eventos, downtime total, proporción de eventos críticos/altos) para marcar equipos anómalos sin un umbral fijado a mano. |
 | Verificación de techo AUC vía oráculo (`GradientBoostingClassifier` vs. la probabilidad real generadora) | `src/model_ceiling_check.py` | Verifica que un AUC débil sea ruido propio de la etiqueta, no una elección de modelo corregible, puntuando la probabilidad real detrás de cada etiqueta sintética contra el held-out y comprobando que ningún modelo — desplegado o más flexible — pueda superarla. |
-| Cliente Anthropic falso con `unittest.mock` | `tests/test_agent.py` | Verifica la lógica de ruteo del dispatcher (tool correcta, argumentos correctos, forma correcta del `tool_result`, manejo de errores, tope de iteraciones) sin ninguna llamada real a la API. |
+| Cliente Anthropic falso con `unittest.mock` | `tests/test_agent.py`, `tests/test_cli.py`, `tests/test_eval_harness.py` | Verifica la lógica de ruteo del dispatcher (tool correcta, argumentos correctos, forma correcta del `tool_result`, manejo de errores, tope de iteraciones, crecimiento del historial multi-turno), el REPL del CLI, y la lógica de scoring del harness de evaluación — todo sin ninguna llamada real a la API. |
+| Estado de conversación multi-turno (`MiningOpsAgent.chat`) | `src/agent.py` | Acumula turnos (incluyendo las llamadas a tools intermedias) en `agent.history` para que una pregunta de seguimiento se resuelva contra el contexto previo, en vez de que cada pregunta arranque desde cero. |
+| Harness de evaluación de selección de tool + groundedness | `src/eval_harness.py` | Un set de preguntas etiquetadas (`EVAL_QUERIES`) verifica si el modelo llama a la(s) tool(s) *correcta(s)* para cada pregunta, y una verificación de extracción de números (`check_groundedness`) comprueba que cada número en la respuesta final provenga de un resultado real de una tool y no de una adivinanza que suena plausible. |
 
 ## Resultados
 
-Cada número y gráfico de abajo viene de `python -m src.generate_report` (`src/visualization/plots.py`), que llama exactamente a las mismas funciones tool que despacha el agente en tiempo de ejecución y grafica sus resultados reales — nada aquí está hardcodeado ni re-simulado por separado de las tools. El pipeline completo (`setup_data.py` → `generate_report.py` → `pytest`, 26/26 pasando, forzado en CI en cada push) es reproducible desde un clone limpio, y los tres resultados de abajo cuentan tres historias distintas sobre qué pasa cuando de verdad se verifica la salida de una tool en vez de confiar en el número que devuelve:
+Cada número y gráfico de abajo viene de `python -m src.generate_report` (`src/visualization/plots.py`), que llama exactamente a las mismas funciones tool que despacha el agente en tiempo de ejecución y grafica sus resultados reales — nada aquí está hardcodeado ni re-simulado por separado de las tools. El pipeline completo (`setup_data.py` → `generate_report.py` → `pytest`, 42/42 pasando, forzado en CI en cada push) es reproducible desde un clone limpio, y los tres resultados de abajo cuentan tres historias distintas sobre qué pasa cuando de verdad se verifica la salida de una tool en vez de confiar en el número que devuelve:
 
 - **`score_credit_risk`** se ve débil (AUC 0,586) hasta que se calcula el techo teórico y resulta que ya captura el 96% del AUC realmente disponible — el modelo no está bajo rendimiento, la etiqueta simplemente es ruidosa por diseño.
 - **`check_maintenance_anomalies`** marca equipos que un ranking simple de downtime pasaría por alto por completo, incluyendo uno marcado por tener *muy poco* downtime — evidencia de que el Isolation Forest usa más de una señal, no solo prueba de que corre.
@@ -132,6 +136,19 @@ Izquierda: recuperación promedio mensual de flotación sobre la ventana sintét
    {'equipment_id': 'EQ-023', 'n_events': 3, 'total_downtime_hours': 10.46, 'critical_share': 0.667, 'anomaly_score': -0.007}]}
 ```
 
+## Harness de evaluación: ¿el agente elige la tool correcta, y se mantiene anclado a datos reales?
+
+El system prompt dice "nunca inventes números que una tool podría devolver" — `src/eval_harness.py` convierte eso de una instrucción en algo verificable. Corre un set etiquetado de preguntas (`EVAL_QUERIES`, incluyendo una pregunta multi-tool y una fuera de alcance donde *ninguna* tool debería dispararse) contra el agente y las tools reales, y puntúa dos cosas por pregunta:
+
+- **Precisión de selección de tool** — ¿el modelo llamó exactamente a la(s) tool(s) que la pregunta realmente necesita?
+- **Groundedness** — ¿cada número en la respuesta final se puede rastrear a un resultado real de una tool (`check_groundedness`), o el modelo afirmó algo que ninguna tool devolvió realmente?
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... python -m src.eval_harness
+```
+
+**Limitación honesta:** no había una `ANTHROPIC_API_KEY` disponible en la máquina donde se construyó esto, así que este repo no reclama un número de accuracy en vivo — eso sería reportar una métrica que nadie midió realmente, justo lo contrario de lo que argumenta el resto de este README. Lo que sí está verificado, en `tests/test_eval_harness.py`, es que la lógica de scoring en sí es correcta: `extract_numbers`/`check_groundedness` están testeadas contra casos armados a mano (una respuesta anclada, un número inventado, sin llamadas a tools), y `run_eval` está testeado contra respuestas mockeadas tanto para una selección de tool correcta como incorrecta. Corré el harness con una key real para obtener números reales.
+
 ## Instalación
 
 ```bash
@@ -167,10 +184,20 @@ pip install -r requirements.txt
 4. **Hablar con el agente** (requiere una `ANTHROPIC_API_KEY` real):
 
    ```bash
+   # Una sola pregunta, sin estado:
    python -m src.cli "¿Cuál fue la recuperación de flotación en septiembre de 2025?"
+
+   # Interactivo, multi-turno (recuerda el contexto entre preguntas hasta que escribís 'reset'):
+   python -m src.cli
    ```
 
-   Sin una key configurada, el CLI termina con un mensaje claro en vez de un traceback.
+   Sin una key configurada, ambos modos terminan con un mensaje claro en vez de un traceback.
+
+5. **Correr el harness de evaluación** (también requiere una `ANTHROPIC_API_KEY` real — ver [Harness de evaluación](#harness-de-evaluación-el-agente-elige-la-tool-correcta-y-se-mantiene-anclado-a-datos-reales) arriba):
+
+   ```bash
+   python -m src.eval_harness
+   ```
 
 ## Decisión de diseño: versionar los datos generados
 

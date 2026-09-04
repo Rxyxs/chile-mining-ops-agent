@@ -107,6 +107,91 @@ def test_agent_returns_text_directly_when_no_tool_use():
     assert client.messages.create.call_count == 1
 
 
+def test_chat_remembers_context_across_turns():
+    # NOTE: MiningOpsAgent mutates its `messages` list in place (see _run_loop's
+    # docstring) so that `chat`'s growing `self.history` reflects tool_use/
+    # tool_result turns as they happen. That means MagicMock's `call_args`,
+    # which stores a *reference* to that same list rather than a copy, would
+    # show its FINAL state (after every later mutation) no matter which past
+    # call you inspect it from -- a mocking artifact, not something the real
+    # Anthropic SDK exhibits (it serializes the request over HTTP at call
+    # time). A custom side_effect that snapshots `list(messages)` on entry
+    # sidesteps that and lets this test check what was actually sent.
+    fake_tool = MagicMock(return_value={"n_batches": 5, "avg_recovery_pct": 88.1})
+    registry = {"get_flotation_summary": fake_tool}
+    schemas = [{"name": "get_flotation_summary", "description": "x", "input_schema": {}}]
+
+    responses = [
+        _response("tool_use", [_tool_use_block("get_flotation_summary", {"month": "2025-09"}, "toolu_1")]),
+        _response("end_turn", [_text_block("September recovery averaged 88.1%.")]),
+        _response("end_turn", [_text_block("August was not asked about; only September data was retrieved.")]),
+    ]
+    sent_messages_snapshots: list[list[dict]] = []
+
+    def _create(**kwargs):
+        sent_messages_snapshots.append(list(kwargs["messages"]))
+        return responses[len(sent_messages_snapshots) - 1]
+
+    client = MagicMock()
+    client.messages.create.side_effect = _create
+
+    agent = MiningOpsAgent(client=client, tool_registry=registry, tool_schemas=schemas)
+    first = agent.chat("What was the flotation summary for September?")
+    second = agent.chat("And what about August?")
+
+    assert first == "September recovery averaged 88.1%."
+    assert second == "August was not asked about; only September data was retrieved."
+    assert len(sent_messages_snapshots) == 3
+
+    # The third call (second turn's first request) must include the full prior
+    # exchange -- the follow-up question alone would lose the September context.
+    third_call_messages = sent_messages_snapshots[2]
+    assert third_call_messages[0]["content"] == "What was the flotation summary for September?"
+    assert third_call_messages[-1]["content"] == "And what about August?"
+    assert len(third_call_messages) == 5  # user, assistant(tool_use), user(tool_result), assistant(text), user(Q2)
+
+
+def test_chat_reset_clears_history():
+    sent_messages_snapshots: list[list[dict]] = []
+
+    def _create(**kwargs):
+        sent_messages_snapshots.append(list(kwargs["messages"]))
+        return _response("end_turn", [_text_block("hi")])
+
+    client = MagicMock()
+    client.messages.create.side_effect = _create
+
+    agent = MiningOpsAgent(client=client, tool_registry={}, tool_schemas=[])
+    agent.chat("first message")
+    assert len(agent.history) == 2
+
+    agent.reset()
+    assert agent.history == []
+
+    agent.chat("fresh start")
+    # After reset, the request should carry only the new message, not the old one.
+    last_call_messages = sent_messages_snapshots[-1]
+    assert len(last_call_messages) == 1
+    assert last_call_messages[0]["content"] == "fresh start"
+
+
+def test_run_does_not_touch_history():
+    fake_tool = MagicMock(return_value={"avg_recovery_pct": 88.1})
+    registry = {"get_flotation_summary": fake_tool}
+    schemas = [{"name": "get_flotation_summary", "description": "x", "input_schema": {}}]
+
+    client = MagicMock()
+    client.messages.create.side_effect = [
+        _response("tool_use", [_tool_use_block("get_flotation_summary", {"month": "2025-09"}, "toolu_1")]),
+        _response("end_turn", [_text_block("88.1%.")]),
+    ]
+
+    agent = MiningOpsAgent(client=client, tool_registry=registry, tool_schemas=schemas)
+    agent.run("What was the flotation summary for September?")
+
+    assert agent.history == []
+
+
 def test_agent_stops_after_max_iterations():
     client = MagicMock()
     # Always asks for a tool -- would loop forever without the bound.

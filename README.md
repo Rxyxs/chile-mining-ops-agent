@@ -30,6 +30,8 @@ flowchart LR
 
 The loop lives in `src/agent.py` (`MiningOpsAgent`). It sends the user message and the tool schemas to the model; if the response asks for `tool_use`, it dispatches to the matching Python function, wraps the result (or the exception, if the tool raised one) as a `tool_result`, and sends it back — up to a bounded number of iterations (default 5) so a misbehaving model can't loop forever.
 
+**Two ways to drive it:** `agent.run(question)` is stateless — one question in, one answer out, no memory of anything before or after. `agent.chat(question)` is the multi-turn version: it appends every turn (including the intermediate `tool_use`/`tool_result` exchanges) to `agent.history` and resends the growing history on each call, so a follow-up like "and what about August?" resolves against the prior answer without the caller re-stating the question. `agent.reset()` clears it. `src/cli.py` exposes both: `python -m src.cli "question"` for one-shot, `python -m src.cli` (no args) for an interactive multi-turn REPL.
+
 ## Tools exposed (`src/tools/`)
 
 All three are plain, synchronous Python functions with a companion JSON schema (`TOOL_SCHEMAS`) in the shape the Anthropic API expects for tool-use (`{"name", "description", "input_schema"}`). Each one runs, and is tested, with **no LLM and no API key involved**.
@@ -52,11 +54,13 @@ The DuckDB warehouse has three synthetic tables: `flotation_batches`, `maintenan
 | `LogisticRegression` (scikit-learn) | `src/tools/credit_risk_tool.py`, `src/setup_data.py` | A small, self-contained credit-risk scoring model trained on synthetic applicant data; returns a probability of default and a risk tier. |
 | `IsolationForest` (scikit-learn) | `src/tools/anomaly_check_tool.py` | Unsupervised outlier detection over per-equipment maintenance features (event count, total downtime, share of critical/high-severity events) to flag anomalous equipment without a hand-set threshold. |
 | Oracle-AUC ceiling check (`GradientBoostingClassifier` vs. the true generating probability) | `src/model_ceiling_check.py` | Verifies a weak AUC is the label's own noise, not a fixable model choice, by scoring the true probability behind each synthetic label against the held-out set and checking no model — deployed or more flexible — can beat it. |
-| `unittest.mock` fake Anthropic client | `tests/test_agent.py` | Verifies the dispatcher's routing logic (correct tool, correct args, correct `tool_result` shape, error handling, iteration cap) without a real API call. |
+| `unittest.mock` fake Anthropic client | `tests/test_agent.py`, `tests/test_cli.py`, `tests/test_eval_harness.py` | Verifies the dispatcher's routing logic (correct tool, correct args, correct `tool_result` shape, error handling, iteration cap, multi-turn history growth), the CLI's REPL, and the eval harness's own scoring logic — all without a real API call. |
+| Multi-turn conversation state (`MiningOpsAgent.chat`) | `src/agent.py` | Accumulates turns (including intermediate tool calls) into `agent.history` so a follow-up question resolves against prior context, instead of every question starting from a blank slate. |
+| Tool-selection + groundedness eval harness | `src/eval_harness.py` | A labeled query set (`EVAL_QUERIES`) checks whether the model calls the *right* tool(s) for a question, and a number-extraction check (`check_groundedness`) verifies every number in its final answer traces back to a real tool result rather than a plausible-sounding guess. |
 
 ## Results
 
-Every number and figure below comes from `python -m src.generate_report` (`src/visualization/plots.py`) calling the exact same tool functions the agent dispatches at runtime and plotting their real outputs — nothing here is hardcoded or re-simulated separately from the tools. The full pipeline (`setup_data.py` → `generate_report.py` → `pytest`, 26/26 passing, CI-enforced on every push) is reproducible from a clean clone, and the three results below tell three different stories about what happens when you actually check a tool's output instead of trusting the number it returns:
+Every number and figure below comes from `python -m src.generate_report` (`src/visualization/plots.py`) calling the exact same tool functions the agent dispatches at runtime and plotting their real outputs — nothing here is hardcoded or re-simulated separately from the tools. The full pipeline (`setup_data.py` → `generate_report.py` → `pytest`, 42/42 passing, CI-enforced on every push) is reproducible from a clean clone, and the three results below tell three different stories about what happens when you actually check a tool's output instead of trusting the number it returns:
 
 - **`score_credit_risk`** looks weak (AUC 0.586) until you compute the theoretical ceiling and find it's already capturing 96% of the AUC that's actually available — the model isn't underperforming, the label is just noisy by design.
 - **`check_maintenance_anomalies`** flags equipment a simple downtime ranking would miss entirely, including one flagged for having *too little* downtime — evidence the Isolation Forest is using more than one signal, not just proof it runs.
@@ -132,6 +136,19 @@ Left: monthly average flotation recovery over the synthetic 12-month window — 
    {'equipment_id': 'EQ-023', 'n_events': 3, 'total_downtime_hours': 10.46, 'critical_share': 0.667, 'anomaly_score': -0.007}]}
 ```
 
+## Evaluation harness: does the agent pick the right tool, and does it stay grounded?
+
+The system prompt says "never invent numbers that a tool could return" — `src/eval_harness.py` turns that from an instruction into something checkable. It runs a labeled set of queries (`EVAL_QUERIES`, including a multi-tool query and an out-of-scope one where *no* tool should fire) through the real agent and real tools, and scores two things per query:
+
+- **Tool-selection accuracy** — did the model call exactly the tool(s) the query actually needs?
+- **Groundedness** — does every number in the final answer trace back to a real tool result (`check_groundedness`), or did the model state something that no tool call actually returned?
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... python -m src.eval_harness
+```
+
+**Honest limitation:** no `ANTHROPIC_API_KEY` was available on the machine this was built on, so this repo does not claim a live accuracy number — that would mean reporting a metric nobody actually measured, exactly what the rest of this README argues against. What *is* verified, in `tests/test_eval_harness.py`, is that the scoring logic itself is correct: `extract_numbers`/`check_groundedness` are tested against hand-built cases (a grounded answer, a fabricated number, no tool calls at all), and `run_eval` is tested against scripted mock responses for both a correct and an incorrect tool selection. Run the harness with a real key to get real numbers.
+
 ## Installation
 
 ```bash
@@ -167,10 +184,20 @@ pip install -r requirements.txt
 4. **Talk to the agent** (requires a real `ANTHROPIC_API_KEY`):
 
    ```bash
+   # One-shot, stateless:
    python -m src.cli "What was the flotation recovery in September 2025?"
+
+   # Interactive, multi-turn (remembers context across questions until you type 'reset'):
+   python -m src.cli
    ```
 
-   Without a key set, the CLI exits with a clear message instead of a traceback.
+   Without a key set, either mode exits with a clear message instead of a traceback.
+
+5. **Run the evaluation harness** (also requires a real `ANTHROPIC_API_KEY` — see [Evaluation harness](#evaluation-harness-does-the-agent-pick-the-right-tool-and-does-it-stay-grounded) above):
+
+   ```bash
+   python -m src.eval_harness
+   ```
 
 ## Design decision: versioning the generated data
 
