@@ -51,6 +51,7 @@ El warehouse DuckDB tiene tres tablas sintéticas: `flotation_batches`, `mainten
 | DuckDB, consultas parametrizadas | `src/tools/warehouse_query_tool.py` | Consultas OLAP locales rápidas sobre el warehouse operacional sintético; los parámetros se bindean (placeholders `?`), nunca SQL armado por interpolación de strings. |
 | `LogisticRegression` (scikit-learn) | `src/tools/credit_risk_tool.py`, `src/setup_data.py` | Un modelo de riesgo crediticio pequeño y autocontenido, entrenado sobre datos sintéticos de solicitantes; devuelve una probabilidad de default y un tier de riesgo. |
 | `IsolationForest` (scikit-learn) | `src/tools/anomaly_check_tool.py` | Detección de outliers no supervisada sobre features de mantenimiento por equipo (cantidad de eventos, downtime total, proporción de eventos críticos/altos) para marcar equipos anómalos sin un umbral fijado a mano. |
+| Verificación de techo AUC vía oráculo (`GradientBoostingClassifier` vs. la probabilidad real generadora) | `src/model_ceiling_check.py` | Verifica que un AUC débil sea ruido propio de la etiqueta, no una elección de modelo corregible, puntuando la probabilidad real detrás de cada etiqueta sintética contra el held-out y comprobando que ningún modelo — desplegado o más flexible — pueda superarla. |
 | Cliente Anthropic falso con `unittest.mock` | `tests/test_agent.py` | Verifica la lógica de ruteo del dispatcher (tool correcta, argumentos correctos, forma correcta del `tool_result`, manejo de errores, tope de iteraciones) sin ninguna llamada real a la API. |
 
 ## Resultados
@@ -65,11 +66,23 @@ Generados por `python -m src.generate_report` (`src/visualization/plots.py`), qu
 | `check_maintenance_anomalies` | Equipos marcados (ventana 60d) | 3 / 24 |
 | `get_flotation_summary` | Meses de datos | 12 |
 
-### `score_credit_risk` — débil pero honesto
+### `score_credit_risk` — débil, y ahora verificado que es casi óptimo, no solo "honesto"
 
 ![Evaluación de riesgo crediticio](reports/figures/credit_risk_evaluation.png)
 
-Tres paneles, todos sobre el mismo test held-out (n=400): la curva ROC (izquierda) se pega a la diagonal de "sin habilidad predictiva" — nunca se aleja mucho de ella, que es justo lo que se ve cuando se grafica un ROC-AUC de 0,586 en vez de solo reportar el número. La curva PR (centro) se dispara cerca de recall=0 (un puñado de predicciones de alta probabilidad, confiadas y correctas) y luego decae rápido hacia la tasa base de 0,245, el piso realista al aumentar el recall. El histograma (derecha) hace visible la razón: las distribuciones de probabilidad predicha para "default" y "no default" se solapan casi por completo — el modelo no puede separar limpiamente ambas clases porque, por diseño, `setup_data.py` genera la probabilidad de default latente a partir de una mezcla ruidosa de solo seis features, puntuada con una `LogisticRegression` simple. Esto no es un bug disimulado — es lo que se ve al evaluar honestamente un modelo de ejemplo deliberadamente simple, en vez de elegir una métrica que esconda el solapamiento.
+Tres paneles, todos sobre el mismo test held-out (n=400): la curva ROC (izquierda) se pega a la diagonal de "sin habilidad predictiva" — nunca se aleja mucho de ella, que es justo lo que se ve cuando se grafica un ROC-AUC de 0,586 en vez de solo reportar el número. La curva PR (centro) se dispara cerca de recall=0 (un puñado de predicciones de alta probabilidad, confiadas y correctas) y luego decae rápido hacia la tasa base de 0,245, el piso realista al aumentar el recall. El histograma (derecha) hace visible la razón: las distribuciones de probabilidad predicha para "default" y "no default" se solapan casi por completo.
+
+**Ese solapamiento antes solo se afirmaba como "el modelo es deliberadamente simple". Ahora está medido.** `setup_data.py` calcula un `true_prob_default` para cada solicitante sintético antes de lanzar la moneda que decide su etiqueta `default` — así que la probabilidad real detrás de cada etiqueta se conoce, no se estima. Puntuar *esa* probabilidad contra las etiquetas reales del held-out (`src/model_ceiling_check.py`) da el mejor AUC que cualquier modelo podría lograr acá, porque la única aleatoriedad que queda una vez que conoces la probabilidad real es el propio lanzamiento de la moneda:
+
+![Comparación contra el techo teórico](reports/figures/ceiling_comparison.png)
+
+| Modelo | AUC held-out | % del techo capturado |
+|---|---|---|
+| Oráculo (probabilidad real, no ajustada a partir de los datos) | **0,611** | 100% (por definición) |
+| `LogisticRegression` (desplegado en `score_credit_risk`) | 0,586 | **96,0%** |
+| `GradientBoostingClassifier` (solo comparación, no desplegado) | 0,607 | 99,4% |
+
+El modelo logístico desplegado ya captura el 96% del AUC teóricamente disponible — y cambiar a un modelo de gradient boosting considerablemente más flexible solo cierra la brecha restante a 99,4%, no supera el techo. Eso descarta la explicación alternativa obvia para un AUC débil (una elección de modelo poco potente): la etiqueta misma es así de ruidosa por construcción (un lanzamiento de moneda alrededor de una probabilidad que va aproximadamente de 0,04 a 0,88 entre solicitantes), y ningún modelo — por más expresivo que sea — puede predecir mejor que una moneda que no le dejan ver. `tests/test_model_ceiling_check.py` fija esto: verifica que ningún AUC de modelo pueda superar al del oráculo, y que el modelo desplegado capture al menos 85% de él.
 
 **Versión interactiva:** [P(default) predicha vs. debt-to-income, los 400 solicitantes held-out, hover para ver el perfil completo](https://htmlpreview.github.io/?https://github.com/Rxyxs/chile-mining-ops-agent/blob/main/outputs/interactive/credit_risk_scores.html) — abre un gráfico Plotly interactivo en vivo (HTML autocontenido, generado por `plot_credit_risk_interactive()` en `src/visualization/plots.py`) en vez de una imagen estática.
 
@@ -162,7 +175,7 @@ En el entorno de build de este proyecto **no hay `ANTHROPIC_API_KEY` disponible*
 **Verificado en esta sesión (clone limpio, virtualenv limpio, comandos reales, output real capturado):**
 - `python -m src.setup_data` corre exitosamente y escribe ambos artefactos (precisión de holdout `0,755` impresa y observada, no asumida).
 - `python -m src.generate_report` corre exitosamente y escribe las cuatro figuras (`credit_risk_evaluation.png`, `anomaly_scores.png`, `warehouse_overview.png`, `warehouse_overview_animated.gif`) más `reports/metrics.json` y `outputs/interactive/credit_risk_scores.html`, todo a partir de resultados reales de las tools/el modelo.
-- `pytest` — **23/23 tests pasando**. Incluye ejecuciones reales de las cinco funciones tool contra el DuckDB y el modelo generados (sin mockear las tools mismas), las cuatro funciones de graficado (verificando que las figuras/el HTML se escriben de verdad a disco con contenido real), el script de reporte, más tests del loop del agente que mockean el cliente de Anthropic (`unittest.mock`) para verificar que el dispatcher llama a la tool correcta con los argumentos correctos, arma bien los bloques `tool_result`, maneja excepciones de las tools sin crashear, y respeta el tope de iteraciones. Esta suite ahora también corre en CI (ver el badge arriba) en cada push — ya no depende de que alguien la vuelva a correr manualmente en una sesión para que siga vigente.
+- `pytest` — **26/26 tests pasando**. Incluye ejecuciones reales de las cinco funciones tool contra el DuckDB y el modelo generados (sin mockear las tools mismas), las cuatro funciones de graficado (verificando que las figuras/el HTML se escriben de verdad a disco con contenido real), el script de reporte, la verificación de techo AUC vía oráculo, más tests del loop del agente que mockean el cliente de Anthropic (`unittest.mock`) para verificar que el dispatcher llama a la tool correcta con los argumentos correctos, arma bien los bloques `tool_result`, maneja excepciones de las tools sin crashear, y respeta el tope de iteraciones. Esta suite ahora también corre en CI (ver el badge arriba) en cada push — ya no depende de que alguien la vuelva a correr manualmente en una sesión para que siga vigente.
 - Cada función tool también se invocó manualmente fuera de pytest — las consultas de warehouse, los dos perfiles de riesgo crediticio, y el chequeo de anomalías de arriba son output real copiado, no parafraseado.
 
 **No verificado:**

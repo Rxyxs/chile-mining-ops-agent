@@ -143,7 +143,8 @@ def _generate_credit_applicants(rng: np.random.Generator, n: int = 2000) -> pd.D
         + 0.00000025 * requested_amount_clp
     )
     prob_default = 1 / (1 + np.exp(-z))
-    default = rng.binomial(1, np.clip(prob_default, 0.02, 0.95))
+    clipped_prob_default = np.clip(prob_default, 0.02, 0.95)
+    default = rng.binomial(1, clipped_prob_default)
 
     return pd.DataFrame(
         {
@@ -154,6 +155,11 @@ def _generate_credit_applicants(rng: np.random.Generator, n: int = 2000) -> pd.D
             "n_late_payments": n_late_payments,
             "requested_amount_clp": requested_amount_clp.round(0),
             "default": default,
+            # The true probability behind each label -- kept only for
+            # src/model_ceiling_check.py, which uses it to check whether a fitted
+            # model is actually leaving AUC on the table or is already near the
+            # ceiling this label's own Bernoulli noise allows. Not a training feature.
+            "true_prob_default": clipped_prob_default,
         }
     )
 

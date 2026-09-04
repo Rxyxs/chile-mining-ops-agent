@@ -6,6 +6,13 @@
     "n_test": 400,
     "base_rate": 0.245
   },
+  "credit_risk_ceiling_check": {
+    "oracle_auc": 0.6108,
+    "logistic_regression_auc": 0.5861,
+    "gradient_boosting_auc": 0.6069,
+    "logistic_ceiling_capture_pct": 96.0,
+    "gbm_ceiling_capture_pct": 99.4
+  },
   "anomaly_check_tool": {
     "window_days": 60,
     "n_equipment_evaluated": 24,

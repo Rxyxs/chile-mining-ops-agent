@@ -120,6 +120,40 @@ def plot_credit_risk_evaluation(
     }
 
 
+def plot_ceiling_comparison(out_dir: str = FIGURES_DIR) -> dict:
+    """Bar chart comparing the fitted models' AUC against the oracle ceiling --
+    the best AUC any model could ever get against this label, computed from the
+    true data-generating probability itself (see src/model_ceiling_check.py)."""
+    from src.model_ceiling_check import compute_ceiling_comparison
+
+    result = compute_ceiling_comparison()
+    os.makedirs(out_dir, exist_ok=True)
+
+    labels = ["LogisticRegression\n(deployed)", "GradientBoosting\n(comparison only)", "Oracle ceiling\n(true probability)"]
+    values = [result["logistic_regression_auc"], result["gradient_boosting_auc"], result["oracle_auc"]]
+    colors = [CAT["blue"], CAT["orange"], INK_SECONDARY]
+
+    fig, ax = plt.subplots(figsize=(7, 5), facecolor=SURFACE)
+    bars = ax.bar(labels, values, color=colors, zorder=3, width=0.55)
+    for bar, v in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, v + 0.01, f"{v:.3f}", ha="center", fontsize=10, color=INK_PRIMARY)
+    ax.axhline(0.5, color=INK_SECONDARY, linewidth=1, linestyle="--", alpha=0.6)
+    ax.text(0.0, 0.51, "random guessing", fontsize=8, color=INK_SECONDARY, ha="left")
+    _style_axes(ax)
+    ax.set_ylim(0.45, max(values) + 0.08)
+    ax.set_ylabel("ROC-AUC (held-out test)", color=INK_SECONDARY, fontsize=9)
+    ax.set_title(
+        f"Deployed model captures {result['logistic_ceiling_capture_pct']:.0f}% of the AUC ceiling",
+        color=INK_PRIMARY, fontsize=11, fontweight="bold", loc="left",
+    )
+    fig.tight_layout()
+    out_path = os.path.join(out_dir, "ceiling_comparison.png")
+    fig.savefig(out_path, dpi=150, facecolor=SURFACE)
+    plt.close(fig)
+
+    return {**result, "figure_path": out_path}
+
+
 def plot_credit_risk_interactive(
     model_path: str = RISK_MODEL_PATH, out_dir: str = INTERACTIVE_DIR
 ) -> dict:

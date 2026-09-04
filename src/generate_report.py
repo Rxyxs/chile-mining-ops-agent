@@ -11,6 +11,7 @@ import os
 
 from src.visualization.plots import (
     plot_anomaly_scores,
+    plot_ceiling_comparison,
     plot_credit_risk_evaluation,
     plot_credit_risk_interactive,
     plot_warehouse_overview,
@@ -22,6 +23,7 @@ REPORTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 
 def main() -> dict:
     credit_risk = plot_credit_risk_evaluation()
+    ceiling = plot_ceiling_comparison()
     anomalies = plot_anomaly_scores()
     warehouse = plot_warehouse_overview()
     plot_warehouse_overview_animated()
@@ -34,6 +36,13 @@ def main() -> dict:
             "test_accuracy": credit_risk["test_accuracy"],
             "n_test": credit_risk["n_test"],
             "base_rate": credit_risk["base_rate"],
+        },
+        "credit_risk_ceiling_check": {
+            "oracle_auc": ceiling["oracle_auc"],
+            "logistic_regression_auc": ceiling["logistic_regression_auc"],
+            "gradient_boosting_auc": ceiling["gradient_boosting_auc"],
+            "logistic_ceiling_capture_pct": ceiling["logistic_ceiling_capture_pct"],
+            "gbm_ceiling_capture_pct": ceiling["gbm_ceiling_capture_pct"],
         },
         "anomaly_check_tool": {
             "window_days": anomalies["window_days"],
