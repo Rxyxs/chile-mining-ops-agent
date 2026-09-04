@@ -1,15 +1,15 @@
 """Tool-use agent loop for mining operations / risk queries.
 
-MiningOpsAgent takes an injected Anthropic client so it can be exercised in
-tests with a mock/fake client that never calls the real API. The real CLI
-entry point (src/cli.py) injects a genuine `anthropic.Anthropic()` client.
+MiningOpsAgent takes an injected OpenAI-compatible client so it can be
+exercised in tests with a mock/fake client that never calls the real API. The
+real CLI entry point (src/cli.py) injects a genuine `openai.OpenAI()` client.
 """
 from __future__ import annotations
 
 import json
 from typing import Any, Callable
 
-DEFAULT_MODEL = "claude-sonnet-5"
+DEFAULT_MODEL = "gpt-4o"
 DEFAULT_MAX_ITERATIONS = 5
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -21,7 +21,7 @@ DEFAULT_SYSTEM_PROMPT = (
 
 
 class MiningOpsAgent:
-    """Runs a bounded tool-use loop against an Anthropic-compatible client."""
+    """Runs a bounded tool-use loop against an OpenAI-compatible client."""
 
     def __init__(
         self,
@@ -77,37 +77,63 @@ class MiningOpsAgent:
     def _run_loop(self, messages: list[dict]) -> str:
         """Shared tool-use loop: mutates `messages` in place as tool calls
         happen (so a caller holding a reference, like `chat`'s `self.history`,
-        sees the intermediate tool_use/tool_result turns too) and returns the
-        model's final text answer."""
+        sees the intermediate assistant/tool turns too) and returns the
+        model's final text answer.
+
+        The system prompt is prepended per request rather than stored in
+        `messages`, so `self.history` stays a pure record of the conversation
+        and a prompt change takes effect on the next turn of an existing
+        conversation instead of only on a fresh one."""
         for _ in range(self.max_iterations):
-            response = self.client.messages.create(
+            response = self.client.chat.completions.create(
                 model=self.model,
                 max_tokens=1024,
-                system=self.system_prompt,
+                messages=[{"role": "system", "content": self.system_prompt}, *messages],
                 tools=self.tool_schemas,
-                messages=messages,
             )
 
-            if response.stop_reason != "tool_use":
-                return _extract_text(response)
+            message = response.choices[0].message
+            tool_calls = getattr(message, "tool_calls", None)
+            if not tool_calls:
+                return (message.content or "").strip()
 
-            messages.append({"role": "assistant", "content": response.content})
+            # Replayed as a plain dict rather than the SDK's own message object:
+            # the next request has to carry this turn's tool_calls back verbatim,
+            # and a dict is what actually goes over the wire.
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.content,
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.function.name,
+                                "arguments": call.function.arguments,
+                            },
+                        }
+                        for call in tool_calls
+                    ],
+                }
+            )
 
-            tool_results = []
-            for block in response.content:
-                if getattr(block, "type", None) != "tool_use":
-                    continue
-                result = self._execute_tool(block.name, block.input or {})
-                tool_results.append(
+            for call in tool_calls:
+                name = call.function.name
+                tool_input, parse_error = _parse_arguments(call.function.arguments)
+                result = (
+                    {"error": parse_error}
+                    if parse_error is not None
+                    else self._execute_tool(name, tool_input)
+                )
+                messages.append(
                     {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "name": name,
                         "content": json.dumps(result, default=str),
-                        "is_error": isinstance(result, dict) and "error" in result,
                     }
                 )
-
-            messages.append({"role": "user", "content": tool_results})
 
         return (
             "I reached the maximum number of tool-use steps "
@@ -115,10 +141,17 @@ class MiningOpsAgent:
         )
 
 
-def _extract_text(response: Any) -> str:
-    parts = [
-        block.text
-        for block in response.content
-        if getattr(block, "type", None) == "text"
-    ]
-    return "\n".join(parts).strip()
+def _parse_arguments(raw: Any) -> tuple[dict, str | None]:
+    """Tool-call arguments arrive as a JSON *string*, which the model is free
+    to get wrong. Returns `(arguments, error)` instead of raising, so a
+    malformed payload is fed back to the model as a tool error on the same
+    never-crash path as a tool that itself blew up (see `_execute_tool`)."""
+    if not raw:
+        return {}, None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}, "Tool arguments were not valid JSON."
+    if not isinstance(parsed, dict):
+        return {}, "Tool arguments must be a JSON object."
+    return parsed, None

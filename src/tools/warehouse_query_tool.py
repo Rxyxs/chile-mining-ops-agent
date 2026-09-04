@@ -129,14 +129,14 @@ WAREHOUSE_QUERY_FUNCTIONS = {
     "get_procurement_summary": get_procurement_summary,
 }
 
-TOOL_SCHEMAS = [
+TOOL_DEFINITIONS = [
     {
         "name": "get_flotation_summary",
         "description": (
             "Returns aggregate flotation plant performance (feed grade, recovery, "
             "concentrate grade, tonnage) for a given month."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "month": {
@@ -153,7 +153,7 @@ TOOL_SCHEMAS = [
             "Returns maintenance/alert events from the last N days across the "
             "equipment fleet, ordered by severity."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "days": {
@@ -170,7 +170,7 @@ TOOL_SCHEMAS = [
             "Summarizes procurement orders (count, total and average amount in USD), "
             "optionally filtered by status (delivered, pending, delayed, cancelled)."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "status": {

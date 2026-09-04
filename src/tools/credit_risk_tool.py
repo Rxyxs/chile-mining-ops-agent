@@ -73,14 +73,14 @@ def score_credit_risk(
     }
 
 
-TOOL_SCHEMAS = [
+TOOL_DEFINITIONS = [
     {
         "name": "score_credit_risk",
         "description": (
             "Scores an individual credit/loan applicant profile and returns a "
             "probability of default plus a risk tier (low/medium/high/critical)."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "age": {"type": "integer", "description": "Applicant age in years."},

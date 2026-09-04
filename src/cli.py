@@ -3,10 +3,10 @@
     python -m src.cli "que tan riesgoso es un cliente con..."   -- one-shot, stateless
     python -m src.cli                                            -- interactive multi-turn chat
 
-Requires a real ANTHROPIC_API_KEY in the environment -- this entry point
-talks to the live Anthropic API. The tools themselves work without any API
-key (see src/tools/), and the agent loop is unit-tested with a mocked
-client (see tests/test_agent.py).
+Requires a real OPENAI_API_KEY in the environment -- this entry point talks to
+the live OpenAI API. The tools themselves work without any API key (see
+src/tools/), and the agent loop is unit-tested with a mocked client (see
+tests/test_agent.py).
 """
 from __future__ import annotations
 
@@ -21,13 +21,13 @@ from src.tools import TOOL_REGISTRY, TOOL_SCHEMAS
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         print(
-            "ANTHROPIC_API_KEY is not set. Set it in your environment to run "
-            "the agent against the real Anthropic API, e.g.:\n"
-            "  PowerShell:  $env:ANTHROPIC_API_KEY = 'sk-ant-...'\n"
-            "  bash:        export ANTHROPIC_API_KEY='sk-ant-...'\n"
+            "OPENAI_API_KEY is not set. Set it in your environment to run "
+            "the agent against the real OpenAI API, e.g.:\n"
+            "  PowerShell:  $env:OPENAI_API_KEY = 'sk-...'\n"
+            "  bash:        export OPENAI_API_KEY='sk-...'\n"
             "The tools themselves (src/tools/) work without a key and are "
             "covered by the test suite (`pytest`).",
             file=sys.stderr,
@@ -35,15 +35,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        import anthropic
+        import openai
     except ImportError:
         print(
-            "The `anthropic` package is not installed. Run: pip install -r requirements.txt",
+            "The `openai` package is not installed. Run: pip install -r requirements.txt",
             file=sys.stderr,
         )
         return 1
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = openai.OpenAI(api_key=api_key)
     agent = MiningOpsAgent(client=client, tool_registry=TOOL_REGISTRY, tool_schemas=TOOL_SCHEMAS)
 
     if argv:

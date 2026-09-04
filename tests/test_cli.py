@@ -1,6 +1,6 @@
 """Tests for the CLI entry point: the one-shot mode (existing behavior) and
 the new interactive multi-turn REPL. Both are exercised without a real
-ANTHROPIC_API_KEY by monkeypatching os.environ and the `anthropic` module
+OPENAI_API_KEY by monkeypatching os.environ and the `openai` module
 that src.cli imports lazily inside main().
 """
 from __future__ import annotations
@@ -14,24 +14,24 @@ import pytest
 from src import cli
 
 
-def _install_fake_anthropic(monkeypatch: pytest.MonkeyPatch, fake_client: MagicMock) -> None:
-    fake_module = types.SimpleNamespace(Anthropic=MagicMock(return_value=fake_client))
-    monkeypatch.setitem(sys.modules, "anthropic", fake_module)
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake-for-tests")
+def _install_fake_openai(monkeypatch: pytest.MonkeyPatch, fake_client: MagicMock) -> None:
+    fake_module = types.SimpleNamespace(OpenAI=MagicMock(return_value=fake_client))
+    monkeypatch.setitem(sys.modules, "openai", fake_module)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-for-tests")
 
 
 def test_main_without_api_key_fails_cleanly(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     exit_code = cli.main(["hola"])
 
     assert exit_code == 1
-    assert "ANTHROPIC_API_KEY is not set" in capsys.readouterr().err
+    assert "OPENAI_API_KEY is not set" in capsys.readouterr().err
 
 
 def test_main_one_shot_mode_calls_agent_run(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     fake_client = MagicMock()
-    _install_fake_anthropic(monkeypatch, fake_client)
+    _install_fake_openai(monkeypatch, fake_client)
 
     fake_agent = MagicMock()
     fake_agent.run.return_value = "Recovery averaged 88.1%."
@@ -47,7 +47,7 @@ def test_main_one_shot_mode_calls_agent_run(monkeypatch: pytest.MonkeyPatch, cap
 
 def test_main_with_no_args_launches_repl(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_client = MagicMock()
-    _install_fake_anthropic(monkeypatch, fake_client)
+    _install_fake_openai(monkeypatch, fake_client)
 
     called = {}
 

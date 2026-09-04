@@ -11,11 +11,11 @@ logic (extract_numbers, check_groundedness, run_eval) against small scripted
 mock clients, the same pattern tests/test_agent.py already uses, so it needs
 no live API key to prove the harness itself is correct.
 
-This module's own __main__ block, by contrast, needs a real ANTHROPIC_API_KEY
+This module's own __main__ block, by contrast, needs a real OPENAI_API_KEY
 -- it measures actual model behavior, which a mock client can't tell you
 anything true about. Run it with:
 
-    ANTHROPIC_API_KEY=sk-ant-... python -m src.eval_harness
+    OPENAI_API_KEY=sk-... python -m src.eval_harness
 
 No live key was available on the machine this harness was built on, so no
 real accuracy numbers are claimed anywhere in this repo's README for it --
@@ -133,8 +133,8 @@ def _tracing_registry(base_registry: dict[str, Callable[..., Any]]) -> tuple[dic
 def run_eval(client: Any, eval_queries: tuple[EvalQuery, ...] = EVAL_QUERIES) -> dict:
     """Runs every query in `eval_queries` against a fresh agent (one per
     query, so no cross-query state leaks), using the real tools from
-    src/tools -- only the Anthropic client is swappable, so this can run
-    against either a real `anthropic.Anthropic()` client or a scripted mock.
+    src/tools -- only the model client is swappable, so this can run
+    against either a real `openai.OpenAI()` client or a scripted mock.
     Returns per-query results plus aggregate tool-selection accuracy and
     groundedness rate."""
     results = []
@@ -175,10 +175,10 @@ if __name__ == "__main__":
     import os
     import sys
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         print(
-            "ANTHROPIC_API_KEY is not set. This harness measures real model "
+            "OPENAI_API_KEY is not set. This harness measures real model "
             "behavior and refuses to fabricate numbers by running against a "
             "mock client instead -- see tests/test_eval_harness.py for a "
             "mocked demonstration of the scoring logic itself, which is not "
@@ -187,8 +187,8 @@ if __name__ == "__main__":
         )
         raise SystemExit(1)
 
-    import anthropic
+    import openai
 
-    real_client = anthropic.Anthropic(api_key=api_key)
+    real_client = openai.OpenAI(api_key=api_key)
     summary = run_eval(real_client)
     print(json.dumps(summary, indent=2, ensure_ascii=False))

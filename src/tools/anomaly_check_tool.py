@@ -104,14 +104,14 @@ def check_maintenance_anomalies(
     }
 
 
-TOOL_SCHEMAS = [
+TOOL_DEFINITIONS = [
     {
         "name": "check_maintenance_anomalies",
         "description": (
             "Runs an Isolation Forest over recent equipment maintenance data to "
             "flag equipment with statistically anomalous event/downtime patterns."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "days": {

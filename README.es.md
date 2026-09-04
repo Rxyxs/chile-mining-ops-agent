@@ -8,7 +8,7 @@
 
 Construí esto después de notar lo frágil que es un dashboard fijo para el tipo de pregunta que la gente realmente hace sobre una operación minera. Un dashboard responde exactamente las preguntas para las que sus pantallas fueron diseñadas — la recuperación de flotación de este mes, las alertas de mantenimiento de esta semana, el score de riesgo de este solicitante — pero apenas alguien pregunta algo un poco distinto ("¿la recuperación de septiembre fue normal, y algún equipo con mucho downtime también está marcado como anómalo?"), o hace falta una pantalla nueva o alguien corre una consulta ad hoc a mano. Ninguna de las dos opciones escala, y la segunda es justo donde los números se recuerdan mal o se estiman bajo presión de tiempo.
 
-Lo que quise probar acá es si un loop de tool-calling con un LLM da algo mejor que ambas opciones: una interfaz en lenguaje natural que pueda responder un rango más amplio de preguntas ad hoc que cualquier dashboard fijo, pero manteniéndose **anclada a datos reales** — cada número en su respuesta tiene que venir de una llamada a una tool real (una consulta DuckDB real, una predicción de modelo real), no de lo que el modelo adivine que sonaría plausible. Ese es todo el punto de enrutar a través de `tools=[...]` en la API de Anthropic en vez de simplemente pedirle al modelo que responda desde contexto: el modelo puede pedir una tool, pero no puede inventar un `tool_result`.
+Lo que quise probar acá es si un loop de tool-calling con un LLM da algo mejor que ambas opciones: una interfaz en lenguaje natural que pueda responder un rango más amplio de preguntas ad hoc que cualquier dashboard fijo, pero manteniéndose **anclada a datos reales** — cada número en su respuesta tiene que venir de una llamada a una tool real (una consulta DuckDB real, una predicción de modelo real), no de lo que el modelo adivine que sonaría plausible. Ese es todo el punto de enrutar a través de `tools=[...]` en la API de chat-completions en vez de simplemente pedirle al modelo que responda desde contexto: el modelo puede pedir una tool, pero no puede inventar un `tool_result`.
 
 Todo lo que las herramientas tocan — los datos operacionales y el modelo de riesgo crediticio — es **sintético y generado dentro de este mismo repo**, con semilla fija (`numpy.random.default_rng(42)`), así que todo el pipeline (schema, datos, modelo, tools, tests) es reproducible desde un clone limpio con `python -m src.setup_data`.
 
@@ -34,7 +34,7 @@ El loop vive en `src/agent.py` (`MiningOpsAgent`). Envía el mensaje del usuario
 
 ## Herramientas expuestas (`src/tools/`)
 
-Las tres son funciones Python planas y síncronas, con un schema JSON asociado (`TOOL_SCHEMAS`) en el formato que espera la API de Anthropic para tool-use (`{"name", "description", "input_schema"}`). Cada una corre, y está testeada, **sin necesitar ningún LLM ni API key**.
+Las tres son funciones Python planas y síncronas, con un schema JSON asociado (`TOOL_DEFINITIONS`) en el formato que espera la API de tool-use (`{"name", "description", "parameters"}`), envuelto en el formato de function-tool del proveedor en `src/tools/__init__.py`. Cada una corre, y está testeada, **sin necesitar ningún LLM ni API key**.
 
 | Tool | Archivo | Qué hace |
 |---|---|---|
@@ -48,13 +48,13 @@ El warehouse DuckDB tiene tres tablas sintéticas: `flotation_batches`, `mainten
 
 | Técnica | Dónde | Para qué sirve |
 |---|---|---|
-| API de tool-use de Anthropic (SDK Python `anthropic`, `messages.create(tools=...)`) | `src/cli.py` | Deja que el modelo decida *qué* tool llamar y con *qué* argumentos, en vez de matching de intención hardcodeado. |
-| Loop de agente acotado (`MiningOpsAgent.run`) | `src/agent.py` | Despacha bloques `tool_use` a funciones Python reales, devuelve los `tool_result` al modelo, y limita las iteraciones (5 por defecto) para que un modelo trabado no entre en loop infinito. |
+| API de tool-use de OpenAI (SDK Python `openai`, `chat.completions.create(tools=...)`) | `src/cli.py` | Deja que el modelo decida *qué* tool llamar y con *qué* argumentos, en vez de matching de intención hardcodeado. |
+| Loop de agente acotado (`MiningOpsAgent.run`) | `src/agent.py` | Despacha los `tool_calls` a funciones Python reales, devuelve los mensajes `tool` al modelo, y limita las iteraciones (5 por defecto) para que un modelo trabado no entre en loop infinito. |
 | DuckDB, consultas parametrizadas | `src/tools/warehouse_query_tool.py` | Consultas OLAP locales rápidas sobre el warehouse operacional sintético; los parámetros se bindean (placeholders `?`), nunca SQL armado por interpolación de strings. |
 | `LogisticRegression` (scikit-learn) | `src/tools/credit_risk_tool.py`, `src/setup_data.py` | Un modelo de riesgo crediticio pequeño y autocontenido, entrenado sobre datos sintéticos de solicitantes; devuelve una probabilidad de default y un tier de riesgo. |
 | `IsolationForest` (scikit-learn) | `src/tools/anomaly_check_tool.py` | Detección de outliers no supervisada sobre features de mantenimiento por equipo (cantidad de eventos, downtime total, proporción de eventos críticos/altos) para marcar equipos anómalos sin un umbral fijado a mano. |
 | Verificación de techo AUC vía oráculo (`GradientBoostingClassifier` vs. la probabilidad real generadora) | `src/model_ceiling_check.py` | Verifica que un AUC débil sea ruido propio de la etiqueta, no una elección de modelo corregible, puntuando la probabilidad real detrás de cada etiqueta sintética contra el held-out y comprobando que ningún modelo — desplegado o más flexible — pueda superarla. |
-| Cliente Anthropic falso con `unittest.mock` | `tests/test_agent.py`, `tests/test_cli.py`, `tests/test_eval_harness.py` | Verifica la lógica de ruteo del dispatcher (tool correcta, argumentos correctos, forma correcta del `tool_result`, manejo de errores, tope de iteraciones, crecimiento del historial multi-turno), el REPL del CLI, y la lógica de scoring del harness de evaluación — todo sin ninguna llamada real a la API. |
+| Cliente OpenAI falso con `unittest.mock` | `tests/test_agent.py`, `tests/test_cli.py`, `tests/test_eval_harness.py` | Verifica la lógica de ruteo del dispatcher (tool correcta, argumentos correctos, forma correcta del mensaje `tool`, manejo de argumentos malformados, tope de iteraciones, crecimiento del historial multi-turno), el REPL del CLI, y la lógica de scoring del harness de evaluación — todo sin ninguna llamada real a la API. |
 | Estado de conversación multi-turno (`MiningOpsAgent.chat`) | `src/agent.py` | Acumula turnos (incluyendo las llamadas a tools intermedias) en `agent.history` para que una pregunta de seguimiento se resuelva contra el contexto previo, en vez de que cada pregunta arranque desde cero. |
 | Harness de evaluación de selección de tool + groundedness | `src/eval_harness.py` | Un set de preguntas etiquetadas (`EVAL_QUERIES`) verifica si el modelo llama a la(s) tool(s) *correcta(s)* para cada pregunta, y una verificación de extracción de números (`check_groundedness`) comprueba que cada número en la respuesta final provenga de un resultado real de una tool y no de una adivinanza que suena plausible. |
 
@@ -144,10 +144,10 @@ El system prompt dice "nunca inventes números que una tool podría devolver" �
 - **Groundedness** — ¿cada número en la respuesta final se puede rastrear a un resultado real de una tool (`check_groundedness`), o el modelo afirmó algo que ninguna tool devolvió realmente?
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-... python -m src.eval_harness
+OPENAI_API_KEY=sk-... python -m src.eval_harness
 ```
 
-**Limitación honesta:** no había una `ANTHROPIC_API_KEY` disponible en la máquina donde se construyó esto, así que este repo no reclama un número de accuracy en vivo — eso sería reportar una métrica que nadie midió realmente, justo lo contrario de lo que argumenta el resto de este README. Lo que sí está verificado, en `tests/test_eval_harness.py`, es que la lógica de scoring en sí es correcta: `extract_numbers`/`check_groundedness` están testeadas contra casos armados a mano (una respuesta anclada, un número inventado, sin llamadas a tools), y `run_eval` está testeado contra respuestas mockeadas tanto para una selección de tool correcta como incorrecta. Corré el harness con una key real para obtener números reales.
+**Limitación honesta:** no había una `OPENAI_API_KEY` disponible en la máquina donde se construyó esto, así que este repo no reclama un número de accuracy en vivo — eso sería reportar una métrica que nadie midió realmente, justo lo contrario de lo que argumenta el resto de este README. Lo que sí está verificado, en `tests/test_eval_harness.py`, es que la lógica de scoring en sí es correcta: `extract_numbers`/`check_groundedness` están testeadas contra casos armados a mano (una respuesta anclada, un número inventado, sin llamadas a tools), y `run_eval` está testeado contra respuestas mockeadas tanto para una selección de tool correcta como incorrecta. Corré el harness con una key real para obtener números reales.
 
 ## Instalación
 
@@ -181,7 +181,7 @@ pip install -r requirements.txt
    pytest
    ```
 
-4. **Hablar con el agente** (requiere una `ANTHROPIC_API_KEY` real):
+4. **Hablar con el agente** (requiere una `OPENAI_API_KEY` real):
 
    ```bash
    # Una sola pregunta, sin estado:
@@ -193,7 +193,7 @@ pip install -r requirements.txt
 
    Sin una key configurada, ambos modos terminan con un mensaje claro en vez de un traceback.
 
-5. **Correr el harness de evaluación** (también requiere una `ANTHROPIC_API_KEY` real — ver [Harness de evaluación](#harness-de-evaluación-el-agente-elige-la-tool-correcta-y-se-mantiene-anclado-a-datos-reales) arriba):
+5. **Correr el harness de evaluación** (también requiere una `OPENAI_API_KEY` real — ver [Harness de evaluación](#harness-de-evaluación-el-agente-elige-la-tool-correcta-y-se-mantiene-anclado-a-datos-reales) arriba):
 
    ```bash
    python -m src.eval_harness

@@ -6,22 +6,24 @@ src/eval_harness.py's module docstring for why that distinction matters.
 """
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from src.eval_harness import EvalQuery, check_groundedness, extract_numbers, run_eval
 
 
-def _text_block(text: str) -> SimpleNamespace:
-    return SimpleNamespace(type="text", text=text)
+def _tool_call(name: str, arguments: dict, call_id: str = "call_1") -> SimpleNamespace:
+    return SimpleNamespace(
+        id=call_id,
+        type="function",
+        function=SimpleNamespace(name=name, arguments=json.dumps(arguments)),
+    )
 
 
-def _tool_use_block(name: str, tool_input: dict, tool_id: str = "toolu_1") -> SimpleNamespace:
-    return SimpleNamespace(type="tool_use", name=name, input=tool_input, id=tool_id)
-
-
-def _response(stop_reason: str, content: list) -> SimpleNamespace:
-    return SimpleNamespace(stop_reason=stop_reason, content=content)
+def _response(content: str | None = None, tool_calls: list | None = None) -> SimpleNamespace:
+    message = SimpleNamespace(content=content, tool_calls=tool_calls)
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
 def test_extract_numbers_finds_plain_and_formatted_numbers():
@@ -66,12 +68,12 @@ def test_run_eval_scores_correct_tool_selection_and_groundedness():
     # Query 1: correct tool, grounded answer.
     # Query 2: no tool expected and none called, but the model fabricates a number.
     responses = [
-        _response("tool_use", [_tool_use_block("get_flotation_summary", {"month": "2025-09"})]),
-        _response("end_turn", [_text_block("Recovery averaged 88.1%.")]),
-        _response("end_turn", [_text_block("I estimate it's around 42% but I'm not sure.")]),
+        _response(tool_calls=[_tool_call("get_flotation_summary", {"month": "2025-09"})]),
+        _response(content="Recovery averaged 88.1%."),
+        _response(content="I estimate it's around 42% but I'm not sure."),
     ]
     client = MagicMock()
-    client.messages.create.side_effect = responses
+    client.chat.completions.create.side_effect = responses
 
     fake_flotation_tool = MagicMock(return_value={"avg_recovery_pct": 88.1})
     import src.eval_harness as eh
@@ -99,11 +101,11 @@ def test_run_eval_flags_wrong_tool_selection():
     eval_queries = (EvalQuery("flotation query", ("get_maintenance_alerts",)),)
 
     responses = [
-        _response("tool_use", [_tool_use_block("get_flotation_summary", {"month": "2025-09"})]),
-        _response("end_turn", [_text_block("Recovery averaged 88.1%.")]),
+        _response(tool_calls=[_tool_call("get_flotation_summary", {"month": "2025-09"})]),
+        _response(content="Recovery averaged 88.1%."),
     ]
     client = MagicMock()
-    client.messages.create.side_effect = responses
+    client.chat.completions.create.side_effect = responses
 
     fake_flotation_tool = MagicMock(return_value={"avg_recovery_pct": 88.1})
     import src.eval_harness as eh
