@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chile Mining Ops Agent</title>
+<meta name="description" content="*[Version en español: README.es.md](README.es.md)*">
+<style>
+  :root { --bg:#FBFAF8; --surface:#FFF; --ink:#23201D; --muted:#6B645D; --line:#E3DED7; --accent:#B5553D; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+    --bg:#171614; --surface:#201E1B; --ink:#EDE9E3; --muted:#A9A29A; --line:#322E2A; --accent:#D9765C; } }
+  :root[data-theme="dark"] { --bg:#171614; --surface:#201E1B; --ink:#EDE9E3; --muted:#A9A29A; --line:#322E2A; --accent:#D9765C; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.68 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:900px; margin:0 auto; padding:0 16px 88px; }
+  header { padding:60px 0 32px; border-bottom:1px solid var(--line); margin-bottom:36px; }
+  h1 { font-size:clamp(1.7rem,5vw,2.4rem); line-height:1.16; margin:0 0 18px; letter-spacing:-.02em; }
+  .lede { font-size:clamp(1rem,2.3vw,1.1rem); color:var(--muted); margin:0 0 22px; max-width:62ch; }
+  .lede strong { color:var(--ink); }
+  .links a { display:inline-block; margin:0 9px 9px 0; padding:9px 15px; border:1px solid var(--line);
+    border-radius:7px; text-decoration:none; color:var(--ink); background:var(--surface); font-size:.9rem;
+    transition:border-color .15s; }
+  .links a:hover { border-color:var(--accent); }
+  h2 { font-size:1.3rem; margin:48px 0 8px; padding-top:12px; border-top:1px solid var(--line); letter-spacing:-.01em; }
+  figure { margin:22px 0; }
+  figure img { width:100%; height:auto; display:block; border:1px solid var(--line); border-radius:9px; background:#fff; }
+  figcaption { font-size:.85rem; color:var(--muted); margin-top:9px; max-width:70ch; }
+  p { margin:0 0 16px; max-width:70ch; }
+  code { background:var(--surface); border:1px solid var(--line); border-radius:4px; padding:1px 5px; font-size:.86em;
+    font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }
+  footer { margin-top:60px; padding-top:22px; border-top:1px solid var(--line); font-size:.86rem; color:var(--muted); }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>Chile Mining Ops Agent</h1>
+<p class="lede">*[Version en español: README.es.md](README.es.md)*</p>
+<div class="links">
+<a href="https://github.com/Rxyxs/chile-mining-ops-agent">Code and method</a>
+<a href="https://github.com/Rxyxs/chile-mining-ops-agent#readme">Full README</a>
+</div></header>
+<p>This page shows the project's results. The methodology, the design decisions and the limitations are documented in the repository's README.</p>
+<h2>`score_credit_risk` — weak, and now verified to be near-optimal, not just &quot;honest&quot;</h2>
+<figure>
+<img src="figures/credit_risk_evaluation.png" alt="Credit risk evaluation" loading="lazy">
+<figcaption>Three panels, all from the same held-out test set (n=400): the ROC curve (left) hugs the no-skill diagonal — it never gets far above it, which is what a ROC-AUC of 0.586 looks like when you actually plot it instead of just reporting the number. The PR curve (center) spikes near recall=0 (a handful of confident, correct high-probability predictions) and then decays fast toward the 0.245 base rate, which is the realistic floor once recall increases. The histogram (right) makes the reason visible: the predicted-probability distributions for &quot;default&quot; and &quot;no default&quot; overlap almost completely.</figcaption>
+</figure>
+<figure>
+<img src="figures/ceiling_comparison.png" alt="Ceiling comparison" loading="lazy">
+</figure>
+<h2>`check_maintenance_anomalies` — downtime isn&#x27;t the whole story</h2>
+<figure>
+<img src="figures/anomaly_scores.png" alt="Anomaly scores by equipment" loading="lazy">
+<figcaption>3 of 24 pieces of equipment get flagged by the <code>IsolationForest</code>, and the flagged ones are <strong>not</strong> simply the three with the most downtime — that&#x27;s the interesting part of this chart. EQ-007 has more total downtime (23.2h) than the flagged EQ-009 (22.6h) but isn&#x27;t flagged; EQ-023 gets flagged at a mid-range 10.4h, well below several normal bars; and EQ-024 is flagged despite having almost no downtime at all (0.5h) — anomalous for being unusually *low*, not high. That&#x27;s expected from an Isolation Forest run over multiple maintenance-event features (frequency, severity, downtime) rather than a single downtime threshold, and it&#x27;s a more realistic signal than &quot;flag whatever has the biggest bar.&quot;</figcaption>
+</figure>
+<h2>`get_flotation_summary` / `get_procurement_summary` — the operational backdrop</h2>
+<figure>
+<img src="figures/warehouse_overview_animated.gif" alt="Warehouse overview animated" loading="lazy">
+<figcaption>The GIF above animates the flotation recovery trend across the 12 months; the PNG below is the static reference for detailed reading.</figcaption>
+</figure>
+<figure>
+<img src="figures/warehouse_overview.png" alt="Warehouse overview" loading="lazy">
+<figcaption>The GIF above animates the flotation recovery trend across the 12 months; the PNG below is the static reference for detailed reading.</figcaption>
+</figure>
+<footer>
+Pablo Reyes · <a href="https://github.com/Rxyxs/chile-mining-ops-agent">github.com/Rxyxs/chile-mining-ops-agent</a> · MIT<br><br>
+Every figure on this page is produced by the repository's pipeline. For the full method and its limitations, see the README.
+</footer>
+</div></body></html>
