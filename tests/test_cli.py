@@ -22,6 +22,7 @@ def _install_fake_openai(monkeypatch: pytest.MonkeyPatch, fake_client: MagicMock
 
 def test_main_without_api_key_fails_cleanly(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("LOCAL_LLM_BASE_URL", raising=False)
 
     exit_code = cli.main(["hola"])
 

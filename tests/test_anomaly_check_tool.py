@@ -4,8 +4,8 @@ from src.tools.anomaly_check_tool import check_maintenance_anomalies
 
 
 def test_check_maintenance_anomalies_runs():
-    result = check_maintenance_anomalies(days=365, contamination=0.1)
-    assert result["window_days"] == 365
+    result = check_maintenance_anomalies(days=200, contamination=0.1)
+    assert result["window_days"] == 200
     assert "flagged" in result
     assert isinstance(result["flagged"], list)
     assert result["n_equipment_flagged"] == len(result["flagged"])

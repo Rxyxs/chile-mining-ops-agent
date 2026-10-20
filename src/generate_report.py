@@ -11,9 +11,6 @@ import os
 
 from src.visualization.plots import (
     plot_anomaly_scores,
-    plot_ceiling_comparison,
-    plot_credit_risk_evaluation,
-    plot_credit_risk_interactive,
     plot_warehouse_overview,
     plot_warehouse_overview_animated,
 )
@@ -22,36 +19,21 @@ REPORTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 
 
 def main() -> dict:
-    credit_risk = plot_credit_risk_evaluation()
-    ceiling = plot_ceiling_comparison()
     anomalies = plot_anomaly_scores()
     warehouse = plot_warehouse_overview()
     plot_warehouse_overview_animated()
-    plot_credit_risk_interactive()
 
     summary = {
-        "credit_risk_tool": {
-            "roc_auc": credit_risk["roc_auc"],
-            "pr_auc": credit_risk["pr_auc"],
-            "test_accuracy": credit_risk["test_accuracy"],
-            "n_test": credit_risk["n_test"],
-            "base_rate": credit_risk["base_rate"],
-        },
-        "credit_risk_ceiling_check": {
-            "oracle_auc": ceiling["oracle_auc"],
-            "logistic_regression_auc": ceiling["logistic_regression_auc"],
-            "gradient_boosting_auc": ceiling["gradient_boosting_auc"],
-            "logistic_ceiling_capture_pct": ceiling["logistic_ceiling_capture_pct"],
-            "gbm_ceiling_capture_pct": ceiling["gbm_ceiling_capture_pct"],
-        },
         "anomaly_check_tool": {
             "window_days": anomalies["window_days"],
             "n_equipment_evaluated": anomalies["n_equipment_evaluated"],
             "n_equipment_flagged": anomalies["n_equipment_flagged"],
+            "flagged": [r["equipment_id"] for r in anomalies["flagged"]],
         },
         "warehouse_query_tool": {
             "n_months": warehouse["n_months"],
             "n_procurement_categories": warehouse["n_procurement_categories"],
+            "avg_silica_concentrate_pct_by_month": warehouse["avg_silica_concentrate_pct_by_month"],
         },
     }
 

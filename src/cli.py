@@ -1,12 +1,13 @@
 """Command-line entry point for the mining ops agent.
 
-    python -m src.cli "que tan riesgoso es un cliente con..."   -- one-shot, stateless
-    python -m src.cli                                            -- interactive multi-turn chat
+    python -m src.cli "como estuvo la silice en junio de 2017?"   -- one-shot, stateless
+    python -m src.cli                                              -- interactive multi-turn chat
 
-Requires a real OPENAI_API_KEY in the environment -- this entry point talks to
-the live OpenAI API. The tools themselves work without any API key (see
-src/tools/), and the agent loop is unit-tested with a mocked client (see
-tests/test_agent.py).
+Talks to the OpenAI API with OPENAI_API_KEY, or, if LOCAL_LLM_BASE_URL is set, to a
+local OpenAI-compatible server (llama-cpp-python serving Qwen2.5) with no key; local
+replies go through `src/local_client.ToolCallParsingClient`. The tools themselves work
+without any model (see src/tools/), and the agent loop is unit-tested with a mocked
+client (see tests/test_agent.py).
 """
 from __future__ import annotations
 
@@ -21,13 +22,15 @@ from src.tools import TOOL_REGISTRY, TOOL_SCHEMAS
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
 
+    local_url = os.environ.get("LOCAL_LLM_BASE_URL")
     api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
+    if not api_key and not local_url:
         print(
             "OPENAI_API_KEY is not set. Set it in your environment to run "
             "the agent against the real OpenAI API, e.g.:\n"
             "  PowerShell:  $env:OPENAI_API_KEY = 'sk-...'\n"
             "  bash:        export OPENAI_API_KEY='sk-...'\n"
+            "Or set LOCAL_LLM_BASE_URL (e.g. http://localhost:8011/v1) to use a local model.\n"
             "The tools themselves (src/tools/) work without a key and are "
             "covered by the test suite (`pytest`).",
             file=sys.stderr,
@@ -43,8 +46,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    client = openai.OpenAI(api_key=api_key)
-    agent = MiningOpsAgent(client=client, tool_registry=TOOL_REGISTRY, tool_schemas=TOOL_SCHEMAS)
+    if local_url:
+        from src.local_client import ToolCallParsingClient
+
+        client = ToolCallParsingClient(openai.OpenAI(api_key="not-needed", base_url=local_url, timeout=600))
+        agent = MiningOpsAgent(client=client, tool_registry=TOOL_REGISTRY, tool_schemas=TOOL_SCHEMAS,
+                               model=os.environ.get("LOCAL_LLM_MODEL", "local"))
+    else:
+        client = openai.OpenAI(api_key=api_key)
+        agent = MiningOpsAgent(client=client, tool_registry=TOOL_REGISTRY, tool_schemas=TOOL_SCHEMAS)
 
     if argv:
         question = " ".join(argv)

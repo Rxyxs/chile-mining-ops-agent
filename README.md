@@ -1,16 +1,22 @@
 # Chile Mining Ops Agent
 
-*[Version en español: README.es.md](README.es.md)*
+*[Versión en español: README.es.md](README.es.md)*
 
 [![tests](https://github.com/Rxyxs/chile-mining-ops-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/Rxyxs/chile-mining-ops-agent/actions/workflows/tests.yml)
 
 ## Overview
 
-I built this after noticing how brittle a fixed dashboard is for the kind of question people actually ask about a mining operation. A dashboard answers exactly the questions its screens were designed for — this month's flotation recovery, this week's maintenance alerts, this applicant's risk score — but the moment someone asks something slightly off that shape ("was September's recovery normal, and is any of the equipment that's been down a lot also flagged as anomalous?"), you either need a new screen or someone runs an ad hoc query by hand. Neither scales, and the second one is exactly where numbers get misremembered or fudged under time pressure.
+A fixed dashboard answers the questions its screens were built for. The moment someone asks something slightly off that shape ("how was silica in June, and did any instrument freeze that month?"), you need a new screen or an ad hoc query by hand, and the second is where numbers get misremembered.
 
-What I wanted to test here is whether an LLM tool-calling loop gives you something better than either option: a natural-language front end that can answer a wider range of ad hoc questions than any fixed dashboard, while staying **grounded** — every number in its answer has to come from an actual tool call (a real DuckDB query, a real model prediction), not from the model's own guess at what a plausible-sounding number would be. That's the whole point of routing through `tools=[...]` in the chat-completions API instead of just asking the model to answer from context: the model can request a tool, but it cannot fabricate a `tool_result`.
+This repo tests whether an LLM tool-calling loop does better: a natural-language front end that answers a wider range of questions while staying **grounded**. Every number in an answer has to come from a real tool call (a DuckDB query, an Isolation Forest run), not from the model's guess. The model can request a tool, but it cannot fabricate a `tool_result`.
 
-Everything a tool touches — the operational data and the credit-risk model — is **synthetic and generated inside this repo**, with a fixed random seed (`numpy.random.default_rng(42)`), so the whole pipeline (schema, data, model, tools, tests) is reproducible from a clean clone with `python -m src.setup_data`.
+Everything the tools touch is **real public data**:
+
+- **Flotation:** an iron-ore reverse flotation plant (Kaggle "Quality Prediction in a Mining Process", 20-second readings and hourly lab assays, March to September 2017), averaged by day.
+- **Equipment events:** detected in that same plant data. A `stuck_sensor` is a process instrument repeating exactly the same 20-second value for at least an hour; a `historian_freeze` is five or more instruments freezing from the same hour (the data feed holding its last values); a `data_gap` is hours missing from the historian.
+- **Procurement:** Chilean public purchase orders (ChileCompra / Mercado Público open data) in four mining-relevant categories, same months: 70,742 orders from 856 public buyers and 3,931 suppliers.
+
+The agent has been run for real: 100 labeled queries against **Qwen2.5-3B-Instruct running locally on CPU**, with no API key (results below).
 
 ## Architecture
 
@@ -19,135 +25,82 @@ flowchart LR
     U[User question] --> A[MiningOpsAgent loop]
     A -->|tool_use requested| D{Dispatcher}
     D --> T1[warehouse_query_tool<br/>DuckDB]
-    D --> T2[credit_risk_tool<br/>LogisticRegression]
-    D --> T3[anomaly_check_tool<br/>IsolationForest]
+    D --> T2[anomaly_check_tool<br/>IsolationForest]
     T1 --> R[tool_result]
     T2 --> R
-    T3 --> R
     R --> A
     A -->|end_turn| F[Final text answer]
 ```
 
-The loop lives in `src/agent.py` (`MiningOpsAgent`). It sends the user message and the tool schemas to the model; if the response asks for `tool_use`, it dispatches to the matching Python function, wraps the result (or the exception, if the tool raised one) as a `tool_result`, and sends it back — up to a bounded number of iterations (default 5) so a misbehaving model can't loop forever.
+The loop lives in `src/agent.py` (`MiningOpsAgent`). It sends the user message and the tool schemas to the model; if the response asks for a tool, it dispatches to the matching Python function, wraps the result (or the exception) as a `tool_result`, and sends it back, up to 5 iterations. `agent.run(question)` is stateless; `agent.chat(question)` keeps multi-turn history.
 
-**Two ways to drive it:** `agent.run(question)` is stateless — one question in, one answer out, no memory of anything before or after. `agent.chat(question)` is the multi-turn version: it appends every turn (including the intermediate `tool_use`/`tool_result` exchanges) to `agent.history` and resends the growing history on each call, so a follow-up like "and what about August?" resolves against the prior answer without the caller re-stating the question. `agent.reset()` clears it. `src/cli.py` exposes both: `python -m src.cli "question"` for one-shot, `python -m src.cli` (no args) for an interactive multi-turn REPL.
+The client is any OpenAI-compatible endpoint: OpenAI itself, or a local model served by llama-cpp-python. The local server returns Qwen's `<tool_call>` blocks as plain text, so `src/local_client.py` parses them into standard `tool_calls` and the agent runs unchanged.
 
 ## Tools exposed (`src/tools/`)
 
-All three are plain, synchronous Python functions with a companion JSON schema (`TOOL_DEFINITIONS`) in the shape the tool-use API expects (`{"name", "description", "parameters"}`), wrapped into the provider's function-tool envelope in `src/tools/__init__.py`. Each one runs, and is tested, with **no LLM and no API key involved**.
+| Tool | What it does |
+|---|---|
+| `get_flotation_summary(month)` | Days and hours with data, average iron in feed and concentrate, average silica in concentrate, hours with high silica (above 4.14%, the plant's P90), ore pulp tonnes. |
+| `get_maintenance_alerts(days)` | Equipment and instrument events in the last N days of plant data (the plant data ends 2017-09-09), most severe first. |
+| `get_procurement_summary(status, category, month)` | Count, total, average and median amount of public purchase orders, in millions of CLP. |
+| `check_maintenance_anomalies(days, contamination)` | Isolation Forest over per-equipment event counts, event hours and severity mix. |
 
-| Tool | File | What it does |
-|---|---|---|
-| `get_flotation_summary`, `get_maintenance_alerts`, `get_procurement_summary` | `warehouse_query_tool.py` | Fixed, named, parameterized queries against a local DuckDB (`data/ops.duckdb`) — **not** arbitrary SQL from the user, by design. |
-| `score_credit_risk` | `credit_risk_tool.py` | Scores a credit applicant profile with a small self-contained `LogisticRegression` trained on synthetic applicants (`data/credit_risk_model.joblib`). |
-| `check_maintenance_anomalies` | `anomaly_check_tool.py` | Runs an `IsolationForest` over recent maintenance events to flag equipment with unusual downtime/severity patterns. |
-
-The DuckDB warehouse has three synthetic tables: `flotation_batches`, `maintenance_events`, `procurement_orders`, all generated by `src/setup_data.py` with `numpy.random.default_rng(42)`.
-
-## Techniques used
-
-| Technique | Where | What it's for |
-|---|---|---|
-| OpenAI tool-use API (`openai` Python SDK, `chat.completions.create(tools=...)`) | `src/cli.py` | Lets the model decide *which* tool to call and with *what* arguments, instead of hand-coded intent matching. |
-| Bounded agent loop (`MiningOpsAgent.run`) | `src/agent.py` | Dispatches `tool_calls` to real Python functions, feeds `tool` messages back to the model, and caps iterations (default 5) so a stuck model can't loop forever. |
-| DuckDB, parameterized queries | `src/tools/warehouse_query_tool.py` | Fast local OLAP queries over the synthetic operations warehouse; parameters are bound (`?` placeholders), never string-interpolated SQL. |
-| `LogisticRegression` (scikit-learn) | `src/tools/credit_risk_tool.py`, `src/setup_data.py` | A small, self-contained credit-risk scoring model trained on synthetic applicant data; returns a probability of default and a risk tier. |
-| `IsolationForest` (scikit-learn) | `src/tools/anomaly_check_tool.py` | Unsupervised outlier detection over per-equipment maintenance features (event count, total downtime, share of critical/high-severity events) to flag anomalous equipment without a hand-set threshold. |
-| Oracle-AUC ceiling check (`GradientBoostingClassifier` vs. the true generating probability) | `src/model_ceiling_check.py` | Verifies a weak AUC is the label's own noise, not a fixable model choice, by scoring the true probability behind each synthetic label against the held-out set and checking no model — deployed or more flexible — can beat it. |
-| `unittest.mock` fake OpenAI client | `tests/test_agent.py`, `tests/test_cli.py`, `tests/test_eval_harness.py` | Verifies the dispatcher's routing logic (correct tool, correct args, correct `tool` message shape, malformed-argument handling, iteration cap, multi-turn history growth), the CLI's REPL, and the eval harness's own scoring logic — all without a real API call. |
-| Multi-turn conversation state (`MiningOpsAgent.chat`) | `src/agent.py` | Accumulates turns (including intermediate tool calls) into `agent.history` so a follow-up question resolves against prior context, instead of every question starting from a blank slate. |
-| Tool-selection + groundedness eval harness | `src/eval_harness.py` | A labeled query set (`EVAL_QUERIES`) checks whether the model calls the *right* tool(s) for a question, and a number-extraction check (`check_groundedness`) verifies every number in its final answer traces back to a real tool result rather than a plausible-sounding guess. |
+All are fixed, named, parameterized queries: there is no arbitrary SQL entry point. The warehouse (`data/ops.duckdb`, 2 MB) is built from the raw downloads by `src/setup_data.py` and committed, so tests and tools run from a clean clone.
 
 ## Results
 
-Every number and figure below comes from `python -m src.generate_report` (`src/visualization/plots.py`) calling the exact same tool functions the agent dispatches at runtime and plotting their real outputs — nothing here is hardcoded or re-simulated separately from the tools. The full pipeline (`setup_data.py` → `generate_report.py` → `pytest`, 42/42 passing, CI-enforced on every push) is reproducible from a clean clone, and the three results below tell three different stories about what happens when you actually check a tool's output instead of trusting the number it returns:
+### The agent, measured: 100 queries, local Qwen2.5-3B
 
-- **`score_credit_risk`** looks weak (AUC 0.586) until you compute the theoretical ceiling and find it's already capturing 96% of the AUC that's actually available — the model isn't underperforming, the label is just noisy by design.
-- **`check_maintenance_anomalies`** flags equipment a simple downtime ranking would miss entirely, including one flagged for having *too little* downtime — evidence the Isolation Forest is using more than one signal, not just proof it runs.
-- **`get_flotation_summary` / `get_procurement_summary`** ground the other two tools in an operational baseline: a real 12-month recovery trend and a real spend breakdown the agent can quote instead of guess.
+`src/eval_queries.py` holds 100 Spanish queries, each labeled with the tools and arguments a correct run must use: 25 flotation (5 ask for months with no data), 12 alerts, 25 procurement, 10 anomaly checks, 16 that need two tools, and 12 out of scope where no tool should fire. `src/eval_harness.py` scores three things per query:
 
-| Tool | Metric | Value |
-|---|---|---|
-| `score_credit_risk` | ROC-AUC (held-out test, n=400) | 0.586 |
-| `score_credit_risk` | PR-AUC (base rate 0.245) | 0.335 |
-| `score_credit_risk` | Test accuracy | 0.755 |
-| `check_maintenance_anomalies` | Equipment flagged (60d window) | 3 / 24 |
-| `get_flotation_summary` | Months of data | 12 |
+- **Tool selection:** exactly the expected tools were called.
+- **Arguments:** the expected tools were called with the expected values (month, status, category, window).
+- **Groundedness:** every number in the answer appears, by value, in a tool result, in the question, or in the tool descriptions.
 
-### `score_credit_risk` — weak, and now verified to be near-optimal, not just "honest"
+| | Run 1: amounts in pesos | Run 2: amounts in millions of CLP |
+|---|---:|---:|
+| Correct tools | 99/100 | 99/100 (95% CI 95–100%) |
+| Correct arguments | 95/100 | 96/100 (95% CI 90–98%) |
+| Grounded answers | 67/100 | **86/100** (95% CI 78–91%) |
+| … procurement queries | 4/25 | **19/25** |
+| … two-tool queries | 8/16 | 12/16 |
 
-![Credit risk evaluation](reports/figures/credit_risk_evaluation.png)
+About 32 minutes per run on CPU. Three findings:
 
-Three panels, all from the same held-out test set (n=400): the ROC curve (left) hugs the no-skill diagonal — it never gets far above it, which is what a ROC-AUC of 0.586 looks like when you actually plot it instead of just reporting the number. The PR curve (center) spikes near recall=0 (a handful of confident, correct high-probability predictions) and then decays fast toward the 0.245 base rate, which is the realistic floor once recall increases. The histogram (right) makes the reason visible: the predicted-probability distributions for "default" and "no default" overlap almost completely.
+1. **Tool choice is not the problem; copying numbers is.** The 3B model picks the right tool 99 times in 100 and the right arguments 95 to 96 times. With amounts in raw pesos (`965616295`), it miscopied them in 21 of 25 procurement answers: ×10 slips, misplaced thousands separators, even "COP" instead of CLP. Returning the same amounts in millions of CLP (`965.62`) raised grounded procurement answers from 4 to 19 of 25 without touching the model. The tool's output format is part of the prompt.
+2. **For months with no data, the model answers about a different month.** Asked for December 2016 or January 2018, it called the tool for March 2017 and reported those numbers without saying so. The argument check catches it (expected `2016-12`, got `2017-03`); groundedness does not, because the numbers are real.
+3. **Groundedness checks numbers, not labels.** The model sometimes reports 720 *hours* with data as "720 days". Every number traces back to a tool result, so the check passes. It is a necessary check, not a sufficient one.
 
-**That overlap used to just be asserted as "the model is deliberately simple." It's now measured.** `setup_data.py` computes a `true_prob_default` for every synthetic applicant before flipping the coin that decides their `default` label — so the true probability behind each label is known, not estimated. Scoring *that* probability against the real held-out labels (`src/model_ceiling_check.py`) gives the best AUC any model could ever achieve here, because the only randomness left once you know the true probability is the coin flip itself:
+The first scoring pass gave 38% grounded, but most of that was the checker, not the model: it compared numbers as strings (`83,678` ≠ `83678.0`) and did not count the 4.14% threshold written in the tool description. The checker now compares values, accepts rounding, and counts the question and tool descriptions as sources; `tests/test_local_client.py` covers those cases.
 
-![Ceiling comparison](reports/figures/ceiling_comparison.png)
+The adapter also had a bug worth noting: Qwen wraps calls as `{{...}}` and sometimes leaves extra closing braces, and the first parser dropped 16 such calls as plain text. It now reads the first complete JSON object. Run 1 in the table is after that fix.
 
-| Model | Held-out AUC | % of ceiling captured |
-|---|---|---|
-| Oracle (true probability, not fit from data) | **0.611** | 100% (by definition) |
-| `LogisticRegression` (deployed in `score_credit_risk`) | 0.586 | **96.0%** |
-| `GradientBoostingClassifier` (comparison only, not deployed) | 0.607 | 99.4% |
+### `check_maintenance_anomalies`: the Isolation Forest misses the worst sensors
 
-The deployed logistic model is already capturing 96% of the AUC that is theoretically available — and swapping in a considerably more flexible gradient-boosted model only closes the remaining gap to 99.4%, it doesn't blow past the ceiling. That rules out the obvious alternative explanation for a weak AUC (an underpowered model choice): the label itself is this noisy by construction (a Bernoulli draw around a probability that only ranges roughly 0.04–0.88 across applicants), and no model — however expressive — can out-predict a coin flip it doesn't get to see. `tests/test_model_ceiling_check.py` locks this in: it asserts no model's AUC can exceed the oracle's, and that the deployed model captures at least 85% of it.
+![Event hours by equipment](reports/figures/anomaly_scores.png)
 
-**Interactive version:** [predicted P(default) vs. debt-to-income, all 400 held-out applicants, hover for the full profile](https://htmlpreview.github.io/?https://github.com/Rxyxs/chile-mining-ops-agent/blob/main/outputs/interactive/credit_risk_scores.html) — opens a live Plotly chart (self-contained HTML, generated by `plot_credit_risk_interactive()` in `src/visualization/plots.py`) rather than a static image.
+Over the plant's 200 days, 11 equipment items have events. The two air-flow instruments of columns 04 and 05 were frozen on the same value for **460 hours** from 10 March, the worst events in the data. The Isolation Forest flags neither: it flags only `plant_historian` (7 events, 336 hours). With 11 points and `contamination=0.1` it flags one item, and two identical outliers make each other look normal. On this data a simple rule (any single event over 24 hours) finds both; the forest earns its place only with many more equipment items than a 7-column plant has.
 
-**Two real applicant profiles scored with `score_credit_risk` (called directly, no LLM in the loop):**
+### Flotation and procurement
 
-| Profile | Age | Income (CLP/mo) | Debt-to-income | Months employed | Late payments | Requested (CLP) | `probability_default` | `risk_tier` |
-|---|---|---|---|---|---|---|---|---|
-| Low-risk example | 42 | 1,400,000 | 0.15 | 96 | 0 | 1,500,000 | **0.0823** | **low** |
-| High-risk example | 24 | 380,000 | 0.92 | 3 | 6 | 5,500,000 | **0.7892** | **critical** |
-
-Both rows are one real call to `score_credit_risk(...)` each, run in this session against the model committed at `data/credit_risk_model.joblib` — not hand-picked to look clean, just two profiles at opposite ends of the input ranges the model was trained on.
-
-### `check_maintenance_anomalies` — downtime isn't the whole story
-
-![Anomaly scores by equipment](reports/figures/anomaly_scores.png)
-
-3 of 24 pieces of equipment get flagged by the `IsolationForest`, and the flagged ones are **not** simply the three with the most downtime — that's the interesting part of this chart. EQ-007 has more total downtime (23.2h) than the flagged EQ-009 (22.6h) but isn't flagged; EQ-023 gets flagged at a mid-range 10.4h, well below several normal bars; and EQ-024 is flagged despite having almost no downtime at all (0.5h) — anomalous for being unusually *low*, not high. That's expected from an Isolation Forest run over multiple maintenance-event features (frequency, severity, downtime) rather than a single downtime threshold, and it's a more realistic signal than "flag whatever has the biggest bar."
-
-### `get_flotation_summary` / `get_procurement_summary` — the operational backdrop
-
-![Warehouse overview animated](reports/figures/warehouse_overview_animated.gif)
 ![Warehouse overview](reports/figures/warehouse_overview.png)
 
-The GIF above animates the flotation recovery trend across the 12 months; the PNG below is the static reference for detailed reading.
-
-Left: monthly average flotation recovery over the synthetic 12-month window — it oscillates in a fairly tight 87–89.5% band, with a visible dip to 86.7% in April 2026 before recovering to a 12-month high of 89.4% in August 2026. Right: procurement spend by category, ranked `services` > `fuel` > `safety_equipment` > `reagents` > `spare_parts` — `services` and `fuel` alone account for roughly 45% of total procurement spend in this synthetic warehouse, ahead of consumables like reagents and spare parts.
-
-**Three more warehouse tool calls, run directly in this session (no LLM involved):**
+Left: monthly silica in concentrate (lower is better), from 2.64% in April down to 2.05% in June and July, and back up to 2.68% in the partial September. Right: public procurement in the four categories, March to September 2017. Fuels and lubricants (38.7 billion CLP) and industrial chemicals (29.8 billion) dwarf mining machinery (6.5 billion) and mining drilling services (3.0 billion).
 
 ```text
->>> get_flotation_summary("2025-09")
-{'n_batches': 18, 'avg_feed_grade_pct': 0.83, 'avg_recovery_pct': 88.87,
- 'avg_concentrate_grade_pct': 28.28, 'total_tonnage_processed': 26282.7, 'month': '2025-09'}
+>>> get_flotation_summary("2017-06")
+{'n_days': 30, 'hours_with_data': 720, 'avg_iron_feed_pct': 58.12, 'avg_iron_concentrate_pct': 65.29,
+ 'avg_silica_concentrate_pct': 2.05, 'hours_silica_high': 30, 'ore_pulp_tonnes': 288213.0, 'month': '2017-06'}
 
->>> get_procurement_summary("delayed")
-{'status_filter': 'delayed', 'n_orders': 66, 'total_amount_usd': 514709.88, 'avg_amount_usd': 7798.63}
+>>> get_procurement_summary(category="mining_machinery", month="2017-03")
+{'n_orders': 699, 'total_amount_million_clp': 965.62, 'avg_amount_million_clp': 1.38,
+ 'median_amount_million_clp': 0.12, ...}
 
->>> check_maintenance_anomalies(days=60)
-{'window_days': 60, 'n_equipment_evaluated': 24, 'n_equipment_flagged': 3,
- 'flagged': [
-   {'equipment_id': 'EQ-009', 'n_events': 7, 'total_downtime_hours': 22.53, 'critical_share': 0.286, 'anomaly_score': -0.0365},
-   {'equipment_id': 'EQ-024', 'n_events': 2, 'total_downtime_hours': 0.6,  'critical_share': 0.5,   'anomaly_score': -0.0174},
-   {'equipment_id': 'EQ-023', 'n_events': 3, 'total_downtime_hours': 10.46, 'critical_share': 0.667, 'anomaly_score': -0.007}]}
+>>> get_maintenance_alerts(days=60)   # 9 events up to 2017-09-09, most severe first
+{'as_of': '2017-09-09', 'n_events': 9, 'events': [
+  {'start': '2017-08-02 08:00', 'equipment_id': 'plant_historian', 'event_type': 'historian_freeze', 'severity': 'medium', 'downtime_hours': 7.73},
+  {'start': '2017-07-31 11:00', 'equipment_id': 'ore_pulp_ph', 'event_type': 'stuck_sensor', 'severity': 'medium', 'downtime_hours': 5.1}, ...]}
 ```
-
-## Evaluation harness: does the agent pick the right tool, and does it stay grounded?
-
-The system prompt says "never invent numbers that a tool could return" — `src/eval_harness.py` turns that from an instruction into something checkable. It runs a labeled set of queries (`EVAL_QUERIES`, including a multi-tool query and an out-of-scope one where *no* tool should fire) through the real agent and real tools, and scores two things per query:
-
-- **Tool-selection accuracy** — did the model call exactly the tool(s) the query actually needs?
-- **Groundedness** — does every number in the final answer trace back to a real tool result (`check_groundedness`), or did the model state something that no tool call actually returned?
-
-```bash
-OPENAI_API_KEY=sk-... python -m src.eval_harness
-```
-
-**Honest limitation:** no `OPENAI_API_KEY` was available on the machine this was built on, so this repo does not claim a live accuracy number — that would mean reporting a metric nobody actually measured, exactly what the rest of this README argues against. What *is* verified, in `tests/test_eval_harness.py`, is that the scoring logic itself is correct: `extract_numbers`/`check_groundedness` are tested against hand-built cases (a grounded answer, a fabricated number, no tool calls at all), and `run_eval` is tested against scripted mock responses for both a correct and an incorrect tool selection. Run the harness with a real key to get real numbers.
 
 ## Installation
 
@@ -159,49 +112,44 @@ pip install -r requirements.txt
 
 ## Usage
 
-1. **Generate the synthetic data and train the risk model:**
-
-   ```bash
-   python -m src.setup_data
-   ```
-
-   Writes `data/ops.duckdb` and `data/credit_risk_model.joblib`.
-
-2. **Generate the result figures and metrics summary:**
-
-   ```bash
-   python -m src.generate_report
-   ```
-
-   Writes `reports/figures/*.png`, `reports/figures/*.gif`, `reports/metrics.json`, and `outputs/interactive/credit_risk_scores.html`.
-
-3. **Run the test suite** (works fully offline, no API key needed):
+1. **Tools and tests** work from a clean clone (the warehouse is committed):
 
    ```bash
    pytest
+   python -m src.generate_report     # figures + reports/metrics.json
    ```
 
-4. **Talk to the agent** (requires a real `OPENAI_API_KEY`):
+2. **Rebuild the warehouse from the raw data** (about 900 MB of downloads into `data/raw/`; the Kaggle part needs `~/.kaggle/kaggle.json`):
 
    ```bash
-   # One-shot, stateless:
-   python -m src.cli "What was the flotation recovery in September 2025?"
-
-   # Interactive, multi-turn (remembers context across questions until you type 'reset'):
-   python -m src.cli
+   python -m src.sources
+   python -m src.setup_data
    ```
 
-   Without a key set, either mode exits with a clear message instead of a traceback.
-
-5. **Run the evaluation harness** (also requires a real `OPENAI_API_KEY` — see [Evaluation harness](#evaluation-harness-does-the-agent-pick-the-right-tool-and-does-it-stay-grounded) above):
+3. **Talk to the agent** with a local model, no key needed:
 
    ```bash
-   python -m src.eval_harness
+   pip install "llama-cpp-python[server]==0.3.2" --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+   python -m llama_cpp.server --model qwen2.5-3b-instruct-q4_k_m.gguf --model_alias local --port 8011
+   # PowerShell: $env:LOCAL_LLM_BASE_URL = "http://localhost:8011/v1"
+   python -m src.cli "¿Cómo estuvo la sílice en el concentrado en junio de 2017?"
    ```
 
-## Design decision: versioning the generated data
+   Or set `OPENAI_API_KEY` instead to use OpenAI.
 
-`data/ops.duckdb`, `data/credit_risk_model.joblib`, `reports/figures/*.png` + `reports/metrics.json`, and `outputs/interactive/credit_risk_scores.html` are committed to the repo rather than gitignored. They are small, fully synthetic/derived, deterministically regenerable (`python -m src.setup_data && python -m src.generate_report`), and versioning them means the tools (and the results above) are visible immediately after a clone without a mandatory setup step. `.gitignore` still excludes the virtual environment and caches.
+4. **Run the evaluation** (100 queries; `--rescore` recomputes the scores of a saved run without calling the model):
+
+   ```bash
+   python -m src.eval_harness --base-url http://localhost:8011/v1 --model local --parse-tool-calls \
+       --output reports/eval_local_qwen2.5-3b.json
+   ```
+
+## Limitations
+
+- The plant is an anonymous iron-ore plant (the Kaggle data does not name it), not a Chilean copper plant. Procurement is Chilean public buyers, not a mining company's own purchasing: Codelco and private miners do not buy through Mercado Público.
+- There is no recovery figure: the dataset has no tailings assay, so metallurgical recovery cannot be computed.
+- Event detection is a rule (identical values for an hour or more), not a maintenance log. A tag held on purpose by an operator also counts as stuck.
+- One local model at one size. Results for larger or hosted models may differ, and the harness runs against any OpenAI-compatible endpoint to check that.
 
 ## Author
 

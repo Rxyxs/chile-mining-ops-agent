@@ -1,218 +1,218 @@
-"""Generates the synthetic operational warehouse (DuckDB) and trains the
-example credit-risk scoring model used by the tools in src/tools/.
+"""Builds the operations warehouse (`data/ops.duckdb`) from real public data.
 
-Everything produced here is synthetic data created with a fixed random seed.
-It does not come from, and is not a copy of, any other repository in the
-portfolio. Run with:
+Three tables, all from real sources:
 
+- `flotation_daily`: daily averages of the Kaggle "Quality Prediction in a Mining
+  Process" dataset (an iron-ore reverse flotation plant, 20-second readings and hourly
+  lab assays, March to September 2017).
+- `maintenance_events`: equipment/instrument events detected in the same plant data.
+  A `stuck_sensor` event is a process tag that repeats exactly the same 20-second value
+  for at least one hour (a frozen transmitter or a tag held by hand); a `data_gap` is
+  an hour missing from the plant historian, and a `historian_freeze` is five or more tags
+  frozen from the same hour (the feed holding its last values). Severity comes from the
+  duration: under 4 h low, 4-12 h medium, 12-24 h high, 24 h or more critical.
+- `procurement_orders`: real ChileCompra purchase-order lines (Mercado Público open
+  data) in four mining-relevant categories, same months as the plant.
+
+The raw files are downloaded by `src/sources.py` into `data/raw/` (gitignored, about
+900 MB). The derived warehouse is small and is committed, so tests and the tools run
+from a clean clone without downloading anything. Rebuild with:
+
+    python -m src.sources
     python -m src.setup_data
 """
 from __future__ import annotations
 
 import os
+import zipfile
 
 import duckdb
 import numpy as np
 import pandas as pd
-from joblib import dump
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
 
-RANDOM_SEED = 42
-
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(ROOT, "data")
+RAW_DIR = os.path.join(DATA_DIR, "raw")
 DUCKDB_PATH = os.path.join(DATA_DIR, "ops.duckdb")
-RISK_MODEL_PATH = os.path.join(DATA_DIR, "credit_risk_model.joblib")
+FLOTATION_CSV = os.path.join(RAW_DIR, "MiningProcess_Flotation_Plant_Database.csv")
+MONTHS = [(2017, m) for m in range(3, 10)]
+
+# Plant's high-silica cut: P90 of the hourly silica in concentrate (4.14%), the same
+# threshold the slm-industrial-gateway repo uses for this plant.
+SILICA_HIGH_PCT = 4.14
+SAMPLES_PER_HOUR = 180  # 20-second readings
+STUCK_MIN_SAMPLES = SAMPLES_PER_HOUR  # one hour of identical readings
+FREEZE_MIN_TAGS = 5  # this many tags frozen from the same hour = historian freeze
+
+# Process tags (20-second instruments). The four % columns are lab assays, hourly or
+# interpolated by design, so a flat run there is not a fault and they are left out.
+PROCESS_TAGS = {
+    "Starch Flow": "starch_flow",
+    "Amina Flow": "amina_flow",
+    "Ore Pulp Flow": "ore_pulp_flow",
+    "Ore Pulp pH": "ore_pulp_ph",
+    "Ore Pulp Density": "ore_pulp_density",
+    **{f"Flotation Column 0{i} Air Flow": f"column_0{i}_air_flow" for i in range(1, 8)},
+    **{f"Flotation Column 0{i} Level": f"column_0{i}_level" for i in range(1, 8)},
+}
+
+# ChileCompra RubroN1 -> category used by the tool.
+PROCUREMENT_CATEGORIES = {
+    "Maquinaria para minería y perforación": "mining_machinery",
+    "Servicios de perforación de minería, petróleo y gas": "mining_services",
+    "Productos químicos industriales": "industrial_chemicals",
+    "Combustibles, lubricantes y anticorrosivos": "fuels_lubricants",
+}
+# ChileCompra order status -> status used by the tool.
+PROCUREMENT_STATUS = {
+    "Recepcion Conforme": "delivered",
+    "Aceptada": "accepted",
+    "Enviada a proveedor": "pending",
+    "En proceso": "pending",
+    "Cancelacion solicitada": "cancelled",
+}
 
 
-def _generate_flotation_batches(rng: np.random.Generator, n_months: int = 12) -> pd.DataFrame:
-    """Synthetic monthly copper flotation batches for one plant."""
+def _severity(hours: float) -> str:
+    if hours >= 24:
+        return "critical"
+    if hours >= 12:
+        return "high"
+    if hours >= 4:
+        return "medium"
+    return "low"
+
+
+def load_flotation_raw(path: str = FLOTATION_CSV) -> pd.DataFrame:
+    raw = pd.read_csv(path, decimal=",")
+    raw["date"] = pd.to_datetime(raw["date"])
+    return raw
+
+
+def build_flotation_daily(raw: pd.DataFrame) -> pd.DataFrame:
+    hourly = raw.groupby("date").mean(numeric_only=True)
+    hourly["silica_high"] = hourly["% Silica Concentrate"] > SILICA_HIGH_PCT
+    day = hourly.index.floor("D")
+    daily = hourly.groupby(day).agg(
+        hours_with_data=("Ore Pulp Flow", "size"),
+        iron_feed_pct=("% Iron Feed", "mean"),
+        silica_feed_pct=("% Silica Feed", "mean"),
+        iron_concentrate_pct=("% Iron Concentrate", "mean"),
+        silica_concentrate_pct=("% Silica Concentrate", "mean"),
+        hours_silica_high=("silica_high", "sum"),
+        amina_flow=("Amina Flow", "mean"),
+        starch_flow=("Starch Flow", "mean"),
+        ore_pulp_ph=("Ore Pulp pH", "mean"),
+        # Ore Pulp Flow is in t/h; one hourly mean x one hour = tonnes that hour.
+        ore_pulp_tonnes=("Ore Pulp Flow", "sum"),
+    )
+    daily.index.name = "date"
+    daily = daily.reset_index()
+    daily["month"] = daily["date"].dt.strftime("%Y-%m")
+    daily["date"] = daily["date"].dt.strftime("%Y-%m-%d")
+    for col in ["iron_feed_pct", "silica_feed_pct", "iron_concentrate_pct", "silica_concentrate_pct"]:
+        daily[col] = daily[col].round(3)
+    for col in ["amina_flow", "starch_flow", "ore_pulp_tonnes"]:
+        daily[col] = daily[col].round(1)
+    daily["ore_pulp_ph"] = daily["ore_pulp_ph"].round(3)
+    daily["hours_silica_high"] = daily["hours_silica_high"].astype(int)
+    return daily[["date", "month", "hours_with_data", "iron_feed_pct", "silica_feed_pct",
+                  "iron_concentrate_pct", "silica_concentrate_pct", "hours_silica_high",
+                  "amina_flow", "starch_flow", "ore_pulp_ph", "ore_pulp_tonnes"]]
+
+
+def detect_events(raw: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    batch_id = 1
-    for month_offset in range(n_months):
-        period = pd.Period("2025-09", freq="M") + month_offset
-        n_batches = rng.integers(18, 28)
-        for _ in range(n_batches):
-            feed_grade = rng.normal(0.85, 0.12)
-            recovery = np.clip(rng.normal(88.0, 3.5), 60, 99)
-            concentrate_grade = np.clip(rng.normal(28.0, 2.0), 15, 40)
-            tonnage = rng.normal(1500, 200)
-            rows.append(
-                {
-                    "batch_id": batch_id,
-                    "month": str(period),
-                    "feed_grade_pct": round(max(feed_grade, 0.05), 3),
-                    "recovery_pct": round(recovery, 2),
-                    "concentrate_grade_pct": round(concentrate_grade, 2),
-                    "tonnage_processed": round(max(tonnage, 10), 1),
-                }
-            )
-            batch_id += 1
-    return pd.DataFrame(rows)
+    # Stuck sensors: runs of identical consecutive 20-second values, at least one hour long.
+    for column, tag in PROCESS_TAGS.items():
+        values = raw[column].to_numpy()
+        change = np.r_[True, values[1:] != values[:-1]]
+        run_id = np.cumsum(change)
+        lengths = np.bincount(run_id)
+        starts = np.flatnonzero(change)
+        for start in starts:
+            n = lengths[run_id[start]]
+            if n >= STUCK_MIN_SAMPLES:
+                hours = round(n / SAMPLES_PER_HOUR, 2)
+                rows.append({"start": raw["date"].iloc[start], "equipment_id": tag,
+                             "event_type": "stuck_sensor", "downtime_hours": hours})
+    # Historian gaps: hours with no data at all.
+    hours = pd.Series(sorted(raw["date"].unique()))
+    gap = hours.diff().dt.total_seconds().div(3600) - 1
+    for i in np.flatnonzero(gap.fillna(0).to_numpy() > 0):
+        rows.append({"start": hours.iloc[i - 1] + pd.Timedelta(hours=1), "equipment_id": "plant_historian",
+                     "event_type": "data_gap", "downtime_hours": float(gap.iloc[i])})
+
+    events = pd.DataFrame(rows)
+    # Many tags frozen from the same hour is the historian (or the whole data feed)
+    # holding its last values, not one transmitter failing: one event, not twenty.
+    stuck = events["event_type"].eq("stuck_sensor")
+    hour = events["start"].dt.floor("h")
+    n_tags = events[stuck].groupby(hour[stuck])["equipment_id"].transform("size")
+    frozen = n_tags[n_tags >= FREEZE_MIN_TAGS].index
+    if len(frozen):
+        freezes = (events.loc[frozen].assign(hour=hour.loc[frozen]).groupby("hour")
+                   .agg(start=("start", "min"), downtime_hours=("downtime_hours", "max"))
+                   .reset_index(drop=True)
+                   .assign(equipment_id="plant_historian", event_type="historian_freeze"))
+        events = pd.concat([events.drop(index=frozen), freezes], ignore_index=True)
+    events = events.sort_values(["start", "equipment_id"]).reset_index(drop=True)
+    events["severity"] = events["downtime_hours"].map(_severity)
+    events.insert(0, "event_id", np.arange(1, len(events) + 1))
+    events["date"] = events["start"].dt.strftime("%Y-%m-%d")
+    events["start"] = events["start"].dt.strftime("%Y-%m-%d %H:%M")
+    return events[["event_id", "date", "start", "equipment_id", "event_type", "severity", "downtime_hours"]]
 
 
-def _generate_maintenance_events(rng: np.random.Generator, n_days: int = 365) -> pd.DataFrame:
-    """Synthetic maintenance/alert events across a fleet of equipment."""
-    equipment_ids = [f"EQ-{i:03d}" for i in range(1, 26)]
-    event_types = ["scheduled", "unscheduled", "inspection", "critical_alert"]
-    severities = ["low", "medium", "high", "critical"]
-    start_date = pd.Timestamp("2025-09-01")
-    rows = []
-    event_id = 1
-    for day in range(n_days):
-        date = start_date + pd.Timedelta(days=day)
-        n_events = rng.poisson(1.4)
-        for _ in range(n_events):
-            equip = rng.choice(equipment_ids)
-            etype = rng.choice(event_types, p=[0.45, 0.30, 0.20, 0.05])
-            severity = rng.choice(severities, p=[0.5, 0.3, 0.15, 0.05])
-            downtime_hours = round(max(rng.exponential(3.0), 0.0), 2)
-            rows.append(
-                {
-                    "event_id": event_id,
-                    "date": date.strftime("%Y-%m-%d"),
-                    "equipment_id": equip,
-                    "event_type": etype,
-                    "severity": severity,
-                    "downtime_hours": downtime_hours,
-                }
-            )
-            event_id += 1
-    return pd.DataFrame(rows)
+def load_procurement(raw_dir: str = RAW_DIR, months=MONTHS) -> pd.DataFrame:
+    usecols = ["Codigo", "FechaCreacion", "Estado", "OrganismoPublico", "NombreProveedor",
+               "RubroN1", "monedaItem", "totalLineaNeto"]
+    frames = []
+    for year, month in months:
+        path = os.path.join(raw_dir, f"oc_{year}-{month}.zip")
+        with zipfile.ZipFile(path) as z:
+            name = z.namelist()[0]
+            df = pd.read_csv(z.open(name), sep=";", encoding="latin-1", usecols=usecols,
+                             low_memory=False, decimal=",")
+        df = df[df["RubroN1"].isin(PROCUREMENT_CATEGORIES) & df["Estado"].isin(PROCUREMENT_STATUS)]
+        df = df[df["monedaItem"].eq("CLP")]
+        frames.append(df)
+    lines = pd.concat(frames, ignore_index=True)
+    lines["totalLineaNeto"] = pd.to_numeric(lines["totalLineaNeto"], errors="coerce")
+    orders = (lines.groupby(["Codigo", "RubroN1"], as_index=False)
+              .agg(date=("FechaCreacion", "first"), status=("Estado", "first"),
+                   buyer=("OrganismoPublico", "first"), supplier=("NombreProveedor", "first"),
+                   amount_clp=("totalLineaNeto", "sum")))
+    orders = orders[orders["amount_clp"] > 0]
+    orders["date"] = pd.to_datetime(orders["date"]).dt.strftime("%Y-%m-%d")
+    orders["category"] = orders["RubroN1"].map(PROCUREMENT_CATEGORIES)
+    orders["status"] = orders["status"].map(PROCUREMENT_STATUS)
+    orders["amount_clp"] = orders["amount_clp"].round(0)
+    orders = orders.rename(columns={"Codigo": "order_id"}).sort_values(["date", "order_id"])
+    return orders[["order_id", "date", "category", "buyer", "supplier", "amount_clp", "status"]].reset_index(drop=True)
 
 
-def _generate_procurement_orders(rng: np.random.Generator, n_orders: int = 400) -> pd.DataFrame:
-    """Synthetic procurement orders (spare parts, reagents, services)."""
-    categories = ["spare_parts", "reagents", "fuel", "services", "safety_equipment"]
-    suppliers = [f"Proveedor-{i}" for i in range(1, 16)]
-    statuses = ["delivered", "pending", "delayed", "cancelled"]
-    start_date = pd.Timestamp("2025-09-01")
-    rows = []
-    for order_id in range(1, n_orders + 1):
-        date = start_date + pd.Timedelta(days=int(rng.integers(0, 365)))
-        category = rng.choice(categories)
-        amount_usd = round(max(rng.lognormal(mean=8.5, sigma=1.1), 50), 2)
-        status = rng.choice(statuses, p=[0.65, 0.15, 0.15, 0.05])
-        rows.append(
-            {
-                "order_id": order_id,
-                "date": date.strftime("%Y-%m-%d"),
-                "category": category,
-                "supplier": rng.choice(suppliers),
-                "amount_usd": amount_usd,
-                "status": status,
-            }
-        )
-    return pd.DataFrame(rows)
+def build_warehouse(db_path: str = DUCKDB_PATH, raw_dir: str = RAW_DIR) -> dict:
+    """Writes data/ops.duckdb from the raw files and returns the row counts."""
+    raw = load_flotation_raw(os.path.join(raw_dir, os.path.basename(FLOTATION_CSV)))
+    flotation = build_flotation_daily(raw)
+    maintenance = detect_events(raw)
+    procurement = load_procurement(raw_dir)
 
-
-def build_warehouse(db_path: str = DUCKDB_PATH, seed: int = RANDOM_SEED) -> None:
-    """Creates data/ops.duckdb with three synthetic operational tables."""
-    rng = np.random.default_rng(seed)
-    flotation = _generate_flotation_batches(rng)
-    maintenance = _generate_maintenance_events(rng)
-    procurement = _generate_procurement_orders(rng)
-
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
     if os.path.exists(db_path):
         os.remove(db_path)
-
     con = duckdb.connect(db_path)
-    con.execute("CREATE TABLE flotation_batches AS SELECT * FROM flotation")
+    con.execute("CREATE TABLE flotation_daily AS SELECT * FROM flotation")
     con.execute("CREATE TABLE maintenance_events AS SELECT * FROM maintenance")
     con.execute("CREATE TABLE procurement_orders AS SELECT * FROM procurement")
     con.close()
-
-
-def _generate_credit_applicants(rng: np.random.Generator, n: int = 2000) -> pd.DataFrame:
-    """Synthetic loan/credit applicant profiles with a latent default label."""
-    age = rng.integers(19, 70, size=n)
-    monthly_income_clp = np.clip(rng.normal(750000, 300000, size=n), 200000, None)
-    debt_to_income = np.clip(rng.normal(0.35, 0.18, size=n), 0.0, 1.5)
-    months_employed = np.clip(rng.normal(48, 36, size=n), 0, None)
-    n_late_payments = rng.poisson(1.2, size=n)
-    requested_amount_clp = np.clip(rng.normal(3_000_000, 1_500_000, size=n), 200000, None)
-
-    # Latent risk score drives a synthetic default probability.
-    z = (
-        -2.5
-        + 2.2 * debt_to_income
-        + 0.35 * n_late_payments
-        - 0.010 * (months_employed / 12)
-        - 0.0000006 * monthly_income_clp
-        + 0.00000025 * requested_amount_clp
-    )
-    prob_default = 1 / (1 + np.exp(-z))
-    clipped_prob_default = np.clip(prob_default, 0.02, 0.95)
-    default = rng.binomial(1, clipped_prob_default)
-
-    return pd.DataFrame(
-        {
-            "age": age,
-            "monthly_income_clp": monthly_income_clp.round(0),
-            "debt_to_income": debt_to_income.round(3),
-            "months_employed": months_employed.round(1),
-            "n_late_payments": n_late_payments,
-            "requested_amount_clp": requested_amount_clp.round(0),
-            "default": default,
-            # The true probability behind each label -- kept only for
-            # src/model_ceiling_check.py, which uses it to check whether a fitted
-            # model is actually leaving AUC on the table or is already near the
-            # ceiling this label's own Bernoulli noise allows. Not a training feature.
-            "true_prob_default": clipped_prob_default,
-        }
-    )
-
-
-FEATURE_COLUMNS = [
-    "age",
-    "monthly_income_clp",
-    "debt_to_income",
-    "months_employed",
-    "n_late_payments",
-    "requested_amount_clp",
-]
-
-
-def train_credit_risk_model(model_path: str = RISK_MODEL_PATH, seed: int = RANDOM_SEED):
-    """Trains a small, self-contained LogisticRegression risk-scoring model.
-
-    Also persists the held-out test set and its predicted probabilities inside
-    the same joblib bundle, so the evaluation plots (ROC/PR/score distribution)
-    are generated from real held-out predictions rather than re-simulated data.
-    """
-    rng = np.random.default_rng(seed + 1)
-    df = _generate_credit_applicants(rng)
-    X = df[FEATURE_COLUMNS]
-    y = df["default"]
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=seed
-    )
-    model = LogisticRegression(max_iter=1000)
-    model.fit(X_train, y_train)
-    test_accuracy = model.score(X_test, y_test)
-    y_proba_test = model.predict_proba(X_test)[:, 1]
-
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    dump(
-        {
-            "model": model,
-            "feature_columns": FEATURE_COLUMNS,
-            "test_accuracy": test_accuracy,
-            "X_test": X_test.reset_index(drop=True),
-            "y_test": y_test.reset_index(drop=True),
-            "y_proba_test": y_proba_test,
-        },
-        model_path,
-    )
-    return model, test_accuracy
+    return {"flotation_daily": len(flotation), "maintenance_events": len(maintenance),
+            "procurement_orders": len(procurement)}
 
 
 def main() -> None:
-    build_warehouse()
-    _, acc = train_credit_risk_model()
-    print(f"DuckDB warehouse written to {DUCKDB_PATH}")
-    print(f"Credit risk model written to {RISK_MODEL_PATH} (holdout accuracy={acc:.3f})")
+    counts = build_warehouse()
+    print(f"DuckDB warehouse written to {DUCKDB_PATH}: {counts}")
 
 
 if __name__ == "__main__":

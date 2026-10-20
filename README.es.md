@@ -6,202 +6,150 @@
 
 ## Resumen
 
-Construí esto después de notar lo frágil que es un dashboard fijo para el tipo de pregunta que la gente realmente hace sobre una operación minera. Un dashboard responde exactamente las preguntas para las que sus pantallas fueron diseñadas — la recuperación de flotación de este mes, las alertas de mantenimiento de esta semana, el score de riesgo de este solicitante — pero apenas alguien pregunta algo un poco distinto ("¿la recuperación de septiembre fue normal, y algún equipo con mucho downtime también está marcado como anómalo?"), o hace falta una pantalla nueva o alguien corre una consulta ad hoc a mano. Ninguna de las dos opciones escala, y la segunda es justo donde los números se recuerdan mal o se estiman bajo presión de tiempo.
+Un dashboard fijo responde las preguntas para las que se diseñaron sus pantallas. Apenas alguien pregunta algo un poco distinto ("¿cómo estuvo la sílice en junio, y se congeló algún instrumento ese mes?"), hace falta una pantalla nueva o una consulta a mano, y ahí es donde los números se recuerdan mal.
 
-Lo que quise probar acá es si un loop de tool-calling con un LLM da algo mejor que ambas opciones: una interfaz en lenguaje natural que pueda responder un rango más amplio de preguntas ad hoc que cualquier dashboard fijo, pero manteniéndose **anclada a datos reales** — cada número en su respuesta tiene que venir de una llamada a una tool real (una consulta DuckDB real, una predicción de modelo real), no de lo que el modelo adivine que sonaría plausible. Ese es todo el punto de enrutar a través de `tools=[...]` en la API de chat-completions en vez de simplemente pedirle al modelo que responda desde contexto: el modelo puede pedir una tool, pero no puede inventar un `tool_result`.
+Este repo prueba si un loop de LLM con herramientas lo hace mejor: una interfaz en lenguaje natural que responde más preguntas sin dejar de estar **anclada**. Cada número de una respuesta tiene que venir de una llamada real a una herramienta (una consulta DuckDB, un Isolation Forest), no de lo que el modelo supone. El modelo puede pedir una herramienta, pero no puede inventar un `tool_result`.
 
-Todo lo que las herramientas tocan — los datos operacionales y el modelo de riesgo crediticio — es **sintético y generado dentro de este mismo repo**, con semilla fija (`numpy.random.default_rng(42)`), así que todo el pipeline (schema, datos, modelo, tools, tests) es reproducible desde un clone limpio con `python -m src.setup_data`.
+Todo lo que tocan las herramientas son **datos públicos reales**:
+
+- **Flotación:** una planta de flotación inversa de mineral de hierro (Kaggle "Quality Prediction in a Mining Process", lecturas cada 20 segundos y análisis de laboratorio horarios, marzo a septiembre de 2017), promediada por día.
+- **Eventos de equipos:** detectados en esos mismos datos de planta. Un `stuck_sensor` es un instrumento de proceso que repite exactamente el mismo valor de 20 segundos durante al menos una hora; un `historian_freeze` son cinco o más instrumentos congelados desde la misma hora (el sistema de datos sosteniendo sus últimos valores); un `data_gap` son horas que faltan en el historiador.
+- **Compras:** órdenes de compra públicas chilenas (datos abiertos de ChileCompra / Mercado Público) en cuatro categorías relevantes para minería, en los mismos meses: 70.742 órdenes de 856 compradores públicos y 3.931 proveedores.
+
+El agente se corrió de verdad: 100 consultas etiquetadas contra **Qwen2.5-3B-Instruct corriendo local en CPU**, sin API key (resultados más abajo).
 
 ## Arquitectura
 
 ```mermaid
 flowchart LR
-    U[Pregunta del usuario] --> A[Loop de MiningOpsAgent]
-    A -->|solicita tool_use| D{Dispatcher}
+    U[Pregunta] --> A[Loop MiningOpsAgent]
+    A -->|pide herramienta| D{Despachador}
     D --> T1[warehouse_query_tool<br/>DuckDB]
-    D --> T2[credit_risk_tool<br/>LogisticRegression]
-    D --> T3[anomaly_check_tool<br/>IsolationForest]
+    D --> T2[anomaly_check_tool<br/>IsolationForest]
     T1 --> R[tool_result]
     T2 --> R
-    T3 --> R
     R --> A
-    A -->|end_turn| F[Respuesta final en texto]
+    A -->|fin| F[Respuesta final]
 ```
 
-El loop vive en `src/agent.py` (`MiningOpsAgent`). Envía el mensaje del usuario y los schemas de las tools al modelo; si la respuesta pide `tool_use`, despacha a la función Python correspondiente, empaqueta el resultado (o la excepción, si la tool falló) como `tool_result`, y lo devuelve — con un tope de iteraciones (5 por defecto) para que un modelo que se comporte mal no entre en loop infinito.
+El loop vive en `src/agent.py` (`MiningOpsAgent`). Envía el mensaje del usuario y los esquemas de las herramientas al modelo; si la respuesta pide una herramienta, llama a la función de Python correspondiente, envuelve el resultado (o la excepción) como `tool_result` y lo devuelve, hasta 5 iteraciones. `agent.run(pregunta)` no guarda estado; `agent.chat(pregunta)` mantiene el historial de varios turnos.
 
-**Dos formas de usarlo:** `agent.run(pregunta)` es sin estado — una pregunta entra, una respuesta sale, sin memoria de nada antes o después. `agent.chat(pregunta)` es la versión multi-turno: agrega cada turno (incluyendo los intercambios intermedios de `tool_use`/`tool_result`) a `agent.history` y reenvía el historial creciente en cada llamada, así una pregunta de seguimiento como "¿y en agosto?" se resuelve contra la respuesta anterior sin que quien pregunta tenga que repetir el contexto. `agent.reset()` lo limpia. `src/cli.py` expone ambos modos: `python -m src.cli "pregunta"` para una sola pregunta, `python -m src.cli` (sin argumentos) para un REPL interactivo multi-turno.
+El cliente es cualquier endpoint compatible con OpenAI: OpenAI mismo, o un modelo local servido con llama-cpp-python. El servidor local devuelve los bloques `<tool_call>` de Qwen como texto plano, así que `src/local_client.py` los convierte en `tool_calls` estándar y el agente corre sin cambios.
 
-## Herramientas expuestas (`src/tools/`)
+## Herramientas (`src/tools/`)
 
-Las tres son funciones Python planas y síncronas, con un schema JSON asociado (`TOOL_DEFINITIONS`) en el formato que espera la API de tool-use (`{"name", "description", "parameters"}`), envuelto en el formato de function-tool del proveedor en `src/tools/__init__.py`. Cada una corre, y está testeada, **sin necesitar ningún LLM ni API key**.
+| Herramienta | Qué hace |
+|---|---|
+| `get_flotation_summary(month)` | Días y horas con datos, hierro promedio en alimentación y concentrado, sílice promedio en concentrado, horas con sílice alta (sobre 4,14%, el P90 de la planta), toneladas de pulpa. |
+| `get_maintenance_alerts(days)` | Eventos de equipos e instrumentos en los últimos N días de datos de planta (los datos terminan el 2017-09-09), los más graves primero. |
+| `get_procurement_summary(status, category, month)` | Cantidad, total, promedio y mediana de órdenes de compra públicas, en millones de CLP. |
+| `check_maintenance_anomalies(days, contamination)` | Isolation Forest sobre la cantidad de eventos, las horas de evento y la gravedad de cada equipo. |
 
-| Tool | Archivo | Qué hace |
-|---|---|---|
-| `get_flotation_summary`, `get_maintenance_alerts`, `get_procurement_summary` | `warehouse_query_tool.py` | Consultas fijas, nombradas y parametrizadas contra un DuckDB local (`data/ops.duckdb`) — **no** SQL arbitrario del usuario, por diseño. |
-| `score_credit_risk` | `credit_risk_tool.py` | Puntúa el perfil de un solicitante de crédito con una `LogisticRegression` pequeña y autocontenida, entrenada sobre solicitantes sintéticos (`data/credit_risk_model.joblib`). |
-| `check_maintenance_anomalies` | `anomaly_check_tool.py` | Corre un `IsolationForest` sobre eventos de mantenimiento recientes para marcar equipos con patrones anómalos de downtime/severidad. |
-
-El warehouse DuckDB tiene tres tablas sintéticas: `flotation_batches`, `maintenance_events`, `procurement_orders`, todas generadas por `src/setup_data.py` con `numpy.random.default_rng(42)`.
-
-## Técnicas usadas
-
-| Técnica | Dónde | Para qué sirve |
-|---|---|---|
-| API de tool-use de OpenAI (SDK Python `openai`, `chat.completions.create(tools=...)`) | `src/cli.py` | Deja que el modelo decida *qué* tool llamar y con *qué* argumentos, en vez de matching de intención hardcodeado. |
-| Loop de agente acotado (`MiningOpsAgent.run`) | `src/agent.py` | Despacha los `tool_calls` a funciones Python reales, devuelve los mensajes `tool` al modelo, y limita las iteraciones (5 por defecto) para que un modelo trabado no entre en loop infinito. |
-| DuckDB, consultas parametrizadas | `src/tools/warehouse_query_tool.py` | Consultas OLAP locales rápidas sobre el warehouse operacional sintético; los parámetros se bindean (placeholders `?`), nunca SQL armado por interpolación de strings. |
-| `LogisticRegression` (scikit-learn) | `src/tools/credit_risk_tool.py`, `src/setup_data.py` | Un modelo de riesgo crediticio pequeño y autocontenido, entrenado sobre datos sintéticos de solicitantes; devuelve una probabilidad de default y un tier de riesgo. |
-| `IsolationForest` (scikit-learn) | `src/tools/anomaly_check_tool.py` | Detección de outliers no supervisada sobre features de mantenimiento por equipo (cantidad de eventos, downtime total, proporción de eventos críticos/altos) para marcar equipos anómalos sin un umbral fijado a mano. |
-| Verificación de techo AUC vía oráculo (`GradientBoostingClassifier` vs. la probabilidad real generadora) | `src/model_ceiling_check.py` | Verifica que un AUC débil sea ruido propio de la etiqueta, no una elección de modelo corregible, puntuando la probabilidad real detrás de cada etiqueta sintética contra el held-out y comprobando que ningún modelo — desplegado o más flexible — pueda superarla. |
-| Cliente OpenAI falso con `unittest.mock` | `tests/test_agent.py`, `tests/test_cli.py`, `tests/test_eval_harness.py` | Verifica la lógica de ruteo del dispatcher (tool correcta, argumentos correctos, forma correcta del mensaje `tool`, manejo de argumentos malformados, tope de iteraciones, crecimiento del historial multi-turno), el REPL del CLI, y la lógica de scoring del harness de evaluación — todo sin ninguna llamada real a la API. |
-| Estado de conversación multi-turno (`MiningOpsAgent.chat`) | `src/agent.py` | Acumula turnos (incluyendo las llamadas a tools intermedias) en `agent.history` para que una pregunta de seguimiento se resuelva contra el contexto previo, en vez de que cada pregunta arranque desde cero. |
-| Harness de evaluación de selección de tool + groundedness | `src/eval_harness.py` | Un set de preguntas etiquetadas (`EVAL_QUERIES`) verifica si el modelo llama a la(s) tool(s) *correcta(s)* para cada pregunta, y una verificación de extracción de números (`check_groundedness`) comprueba que cada número en la respuesta final provenga de un resultado real de una tool y no de una adivinanza que suena plausible. |
+Todas son consultas fijas, con nombre y parámetros: no hay entrada para SQL arbitrario. El almacén (`data/ops.duckdb`, 2 MB) lo construye `src/setup_data.py` desde las descargas y está versionado, así que los tests y las herramientas corren desde un clon limpio.
 
 ## Resultados
 
-Cada número y gráfico de abajo viene de `python -m src.generate_report` (`src/visualization/plots.py`), que llama exactamente a las mismas funciones tool que despacha el agente en tiempo de ejecución y grafica sus resultados reales — nada aquí está hardcodeado ni re-simulado por separado de las tools. El pipeline completo (`setup_data.py` → `generate_report.py` → `pytest`, 42/42 pasando, forzado en CI en cada push) es reproducible desde un clone limpio, y los tres resultados de abajo cuentan tres historias distintas sobre qué pasa cuando de verdad se verifica la salida de una tool en vez de confiar en el número que devuelve:
+### El agente, medido: 100 consultas, Qwen2.5-3B local
 
-- **`score_credit_risk`** se ve débil (AUC 0,586) hasta que se calcula el techo teórico y resulta que ya captura el 96% del AUC realmente disponible — el modelo no está bajo rendimiento, la etiqueta simplemente es ruidosa por diseño.
-- **`check_maintenance_anomalies`** marca equipos que un ranking simple de downtime pasaría por alto por completo, incluyendo uno marcado por tener *muy poco* downtime — evidencia de que el Isolation Forest usa más de una señal, no solo prueba de que corre.
-- **`get_flotation_summary` / `get_procurement_summary`** anclan a las otras dos tools en una línea base operacional: una tendencia real de recuperación de 12 meses y un desglose real de gasto que el agente puede citar en vez de adivinar.
+`src/eval_queries.py` tiene 100 consultas en español, cada una con las herramientas y argumentos que debe usar una respuesta correcta: 25 de flotación (5 piden meses sin datos), 12 de alertas, 25 de compras, 10 de anomalías, 16 que necesitan dos herramientas y 12 fuera de alcance donde no debe usarse ninguna. `src/eval_harness.py` puntúa tres cosas por consulta:
 
-| Tool | Métrica | Valor |
-|---|---|---|
-| `score_credit_risk` | ROC-AUC (test held-out, n=400) | 0,586 |
-| `score_credit_risk` | PR-AUC (tasa base 0,245) | 0,335 |
-| `score_credit_risk` | Accuracy de test | 0,755 |
-| `check_maintenance_anomalies` | Equipos marcados (ventana 60d) | 3 / 24 |
-| `get_flotation_summary` | Meses de datos | 12 |
+- **Herramienta:** se llamaron exactamente las herramientas esperadas.
+- **Argumentos:** se llamaron con los valores esperados (mes, estado, categoría, ventana).
+- **Anclaje:** cada número de la respuesta aparece, por valor, en un resultado de herramienta, en la pregunta o en la descripción de las herramientas.
 
-### `score_credit_risk` — débil, y ahora verificado que es casi óptimo, no solo "honesto"
+| | Corrida 1: montos en pesos | Corrida 2: montos en millones de CLP |
+|---|---:|---:|
+| Herramienta correcta | 99/100 | 99/100 (IC 95% 95–100%) |
+| Argumentos correctos | 95/100 | 96/100 (IC 95% 90–98%) |
+| Respuestas ancladas | 67/100 | **86/100** (IC 95% 78–91%) |
+| … consultas de compras | 4/25 | **19/25** |
+| … consultas de dos herramientas | 8/16 | 12/16 |
 
-![Evaluación de riesgo crediticio](reports/figures/credit_risk_evaluation.png)
+Cerca de 32 minutos por corrida en CPU. Tres hallazgos:
 
-Tres paneles, todos sobre el mismo test held-out (n=400): la curva ROC (izquierda) se pega a la diagonal de "sin habilidad predictiva" — nunca se aleja mucho de ella, que es justo lo que se ve cuando se grafica un ROC-AUC de 0,586 en vez de solo reportar el número. La curva PR (centro) se dispara cerca de recall=0 (un puñado de predicciones de alta probabilidad, confiadas y correctas) y luego decae rápido hacia la tasa base de 0,245, el piso realista al aumentar el recall. El histograma (derecha) hace visible la razón: las distribuciones de probabilidad predicha para "default" y "no default" se solapan casi por completo.
+1. **El problema no es elegir la herramienta, es copiar los números.** El modelo de 3B elige la herramienta correcta 99 de 100 veces y los argumentos correctos 95 a 96. Con montos en pesos (`965616295`), los copió mal en 21 de 25 respuestas de compras: errores de ×10, separadores de miles corridos, hasta "COP" en vez de CLP. Devolver los mismos montos en millones de CLP (`965.62`) subió las respuestas ancladas de compras de 4 a 19 de 25 sin tocar el modelo. El formato de salida de la herramienta es parte del prompt.
+2. **Para meses sin datos, el modelo responde sobre otro mes.** Preguntado por diciembre de 2016 o enero de 2018, llamó a la herramienta con marzo de 2017 y reportó esos números sin decirlo. El chequeo de argumentos lo detecta (esperaba `2016-12`, recibió `2017-03`); el de anclaje no, porque los números son reales.
+3. **El anclaje revisa números, no etiquetas.** El modelo a veces reporta 720 *horas* con datos como "720 días". Cada número viene de un resultado de herramienta, así que el chequeo pasa. Es un chequeo necesario, no suficiente.
 
-**Ese solapamiento antes solo se afirmaba como "el modelo es deliberadamente simple". Ahora está medido.** `setup_data.py` calcula un `true_prob_default` para cada solicitante sintético antes de lanzar la moneda que decide su etiqueta `default` — así que la probabilidad real detrás de cada etiqueta se conoce, no se estima. Puntuar *esa* probabilidad contra las etiquetas reales del held-out (`src/model_ceiling_check.py`) da el mejor AUC que cualquier modelo podría lograr acá, porque la única aleatoriedad que queda una vez que conoces la probabilidad real es el propio lanzamiento de la moneda:
+El primer puntaje daba 38% de respuestas ancladas, pero la mayor parte era el chequeo, no el modelo: comparaba números como texto (`83,678` ≠ `83678.0`) y no contaba el umbral de 4,14% escrito en la descripción de la herramienta. Ahora compara valores, acepta redondeo y cuenta la pregunta y las descripciones como fuentes; `tests/test_local_client.py` cubre esos casos.
 
-![Comparación contra el techo teórico](reports/figures/ceiling_comparison.png)
+El adaptador también tenía un error que vale la pena contar: Qwen envuelve las llamadas como `{{...}}` y a veces deja llaves de cierre de más, y el primer parser descartó 16 de esas llamadas como texto. Ahora lee el primer objeto JSON completo. La corrida 1 de la tabla es posterior a ese arreglo.
 
-| Modelo | AUC held-out | % del techo capturado |
-|---|---|---|
-| Oráculo (probabilidad real, no ajustada a partir de los datos) | **0,611** | 100% (por definición) |
-| `LogisticRegression` (desplegado en `score_credit_risk`) | 0,586 | **96,0%** |
-| `GradientBoostingClassifier` (solo comparación, no desplegado) | 0,607 | 99,4% |
+### `check_maintenance_anomalies`: el Isolation Forest no ve los peores sensores
 
-El modelo logístico desplegado ya captura el 96% del AUC teóricamente disponible — y cambiar a un modelo de gradient boosting considerablemente más flexible solo cierra la brecha restante a 99,4%, no supera el techo. Eso descarta la explicación alternativa obvia para un AUC débil (una elección de modelo poco potente): la etiqueta misma es así de ruidosa por construcción (un lanzamiento de moneda alrededor de una probabilidad que va aproximadamente de 0,04 a 0,88 entre solicitantes), y ningún modelo — por más expresivo que sea — puede predecir mejor que una moneda que no le dejan ver. `tests/test_model_ceiling_check.py` fija esto: verifica que ningún AUC de modelo pueda superar al del oráculo, y que el modelo desplegado capture al menos 85% de él.
+![Horas de evento por equipo](reports/figures/anomaly_scores.png)
 
-**Versión interactiva:** [P(default) predicha vs. debt-to-income, los 400 solicitantes held-out, hover para ver el perfil completo](https://htmlpreview.github.io/?https://github.com/Rxyxs/chile-mining-ops-agent/blob/main/outputs/interactive/credit_risk_scores.html) — abre un gráfico Plotly interactivo en vivo (HTML autocontenido, generado por `plot_credit_risk_interactive()` en `src/visualization/plots.py`) en vez de una imagen estática.
+En los 200 días de la planta, 11 equipos tienen eventos. Los dos instrumentos de flujo de aire de las columnas 04 y 05 quedaron congelados en el mismo valor durante **460 horas** desde el 10 de marzo, los peores eventos de los datos. El Isolation Forest no marca ninguno: solo marca `plant_historian` (7 eventos, 336 horas). Con 11 puntos y `contamination=0.1` marca un equipo, y dos atípicos idénticos se hacen ver normales entre sí. En estos datos una regla simple (cualquier evento de más de 24 horas) encuentra los dos; el bosque solo se justifica con muchos más equipos que los de una planta de 7 columnas.
 
-**Dos perfiles reales de solicitante puntuados con `score_credit_risk` (llamado directamente, sin LLM en el loop):**
+### Flotación y compras
 
-| Perfil | Edad | Ingreso (CLP/mes) | Debt-to-income | Meses empleado | Pagos atrasados | Solicitado (CLP) | `probability_default` | `risk_tier` |
-|---|---|---|---|---|---|---|---|---|
-| Ejemplo bajo riesgo | 42 | 1.400.000 | 0,15 | 96 | 0 | 1.500.000 | **0,0823** | **low** |
-| Ejemplo alto riesgo | 24 | 380.000 | 0,92 | 3 | 6 | 5.500.000 | **0,7892** | **critical** |
+![Resumen del almacén](reports/figures/warehouse_overview.png)
 
-Ambas filas son una llamada real a `score_credit_risk(...)` cada una, corridas en esta sesión contra el modelo versionado en `data/credit_risk_model.joblib` — no elegidas a mano para verse limpias, solo dos perfiles en extremos opuestos de los rangos de entrada con los que se entrenó el modelo.
-
-### `check_maintenance_anomalies` — el downtime no es toda la historia
-
-![Scores de anomalía por equipo](reports/figures/anomaly_scores.png)
-
-3 de 24 equipos quedan marcados por el `IsolationForest`, y los marcados **no** son simplemente los tres con más downtime — esa es la parte interesante de este gráfico. EQ-007 tiene más downtime total (23,2h) que el marcado EQ-009 (22,6h) pero no queda marcado; EQ-023 queda marcado con un downtime medio de 10,4h, por debajo de varias barras normales; y EQ-024 queda marcado a pesar de tener casi nada de downtime (0,5h) — anómalo por ser inusualmente *bajo*, no alto. Es lo esperable de un Isolation Forest que corre sobre múltiples features del evento de mantenimiento (frecuencia, severidad, downtime) en vez de un umbral simple de downtime, y es una señal más realista que "marca la barra más alta".
-
-### `get_flotation_summary` / `get_procurement_summary` — el trasfondo operacional
-
-![Resumen del warehouse animado](reports/figures/warehouse_overview_animated.gif)
-![Resumen del warehouse](reports/figures/warehouse_overview.png)
-
-El GIF de arriba anima la tendencia de recuperación de flotación a lo largo de los 12 meses; el PNG de abajo es la referencia estática para lectura detallada.
-
-Izquierda: recuperación promedio mensual de flotación sobre la ventana sintética de 12 meses — oscila en una banda relativamente estrecha de 87–89,5%, con una caída visible a 86,7% en abril de 2026 antes de recuperarse a un máximo de 12 meses de 89,4% en agosto de 2026. Derecha: gasto de procurement por categoría, ordenado `services` > `fuel` > `safety_equipment` > `reagents` > `spare_parts` — `services` y `fuel` juntos representan cerca del 45% del gasto total de procurement en este warehouse sintético, por delante de consumibles como reactivos y repuestos.
-
-**Tres llamadas más a las tools de warehouse, corridas directamente en esta sesión (sin LLM de por medio):**
+Izquierda: sílice mensual en el concentrado (menos es mejor), de 2,64% en abril a 2,05% en junio y julio, y de vuelta a 2,68% en el septiembre parcial. Derecha: compras públicas en las cuatro categorías, marzo a septiembre de 2017. Combustibles y lubricantes (38.700 millones de CLP) y productos químicos industriales (29.800 millones) superan con creces a la maquinaria minera (6.500 millones) y a los servicios de perforación minera (3.000 millones).
 
 ```text
->>> get_flotation_summary("2025-09")
-{'n_batches': 18, 'avg_feed_grade_pct': 0.83, 'avg_recovery_pct': 88.87,
- 'avg_concentrate_grade_pct': 28.28, 'total_tonnage_processed': 26282.7, 'month': '2025-09'}
+>>> get_flotation_summary("2017-06")
+{'n_days': 30, 'hours_with_data': 720, 'avg_iron_feed_pct': 58.12, 'avg_iron_concentrate_pct': 65.29,
+ 'avg_silica_concentrate_pct': 2.05, 'hours_silica_high': 30, 'ore_pulp_tonnes': 288213.0, 'month': '2017-06'}
 
->>> get_procurement_summary("delayed")
-{'status_filter': 'delayed', 'n_orders': 66, 'total_amount_usd': 514709.88, 'avg_amount_usd': 7798.63}
+>>> get_procurement_summary(category="mining_machinery", month="2017-03")
+{'n_orders': 699, 'total_amount_million_clp': 965.62, 'avg_amount_million_clp': 1.38,
+ 'median_amount_million_clp': 0.12, ...}
 
->>> check_maintenance_anomalies(days=60)
-{'window_days': 60, 'n_equipment_evaluated': 24, 'n_equipment_flagged': 3,
- 'flagged': [
-   {'equipment_id': 'EQ-009', 'n_events': 7, 'total_downtime_hours': 22.53, 'critical_share': 0.286, 'anomaly_score': -0.0365},
-   {'equipment_id': 'EQ-024', 'n_events': 2, 'total_downtime_hours': 0.6,  'critical_share': 0.5,   'anomaly_score': -0.0174},
-   {'equipment_id': 'EQ-023', 'n_events': 3, 'total_downtime_hours': 10.46, 'critical_share': 0.667, 'anomaly_score': -0.007}]}
+>>> get_maintenance_alerts(days=60)   # 9 eventos hasta el 2017-09-09, los más graves primero
+{'as_of': '2017-09-09', 'n_events': 9, 'events': [
+  {'start': '2017-08-02 08:00', 'equipment_id': 'plant_historian', 'event_type': 'historian_freeze', 'severity': 'medium', 'downtime_hours': 7.73},
+  {'start': '2017-07-31 11:00', 'equipment_id': 'ore_pulp_ph', 'event_type': 'stuck_sensor', 'severity': 'medium', 'downtime_hours': 5.1}, ...]}
 ```
-
-## Harness de evaluación: ¿el agente elige la tool correcta, y se mantiene anclado a datos reales?
-
-El system prompt dice "nunca inventes números que una tool podría devolver" — `src/eval_harness.py` convierte eso de una instrucción en algo verificable. Corre un set etiquetado de preguntas (`EVAL_QUERIES`, incluyendo una pregunta multi-tool y una fuera de alcance donde *ninguna* tool debería dispararse) contra el agente y las tools reales, y puntúa dos cosas por pregunta:
-
-- **Precisión de selección de tool** — ¿el modelo llamó exactamente a la(s) tool(s) que la pregunta realmente necesita?
-- **Groundedness** — ¿cada número en la respuesta final se puede rastrear a un resultado real de una tool (`check_groundedness`), o el modelo afirmó algo que ninguna tool devolvió realmente?
-
-```bash
-OPENAI_API_KEY=sk-... python -m src.eval_harness
-```
-
-**Limitación honesta:** no había una `OPENAI_API_KEY` disponible en la máquina donde se construyó esto, así que este repo no reclama un número de accuracy en vivo — eso sería reportar una métrica que nadie midió realmente, justo lo contrario de lo que argumenta el resto de este README. Lo que sí está verificado, en `tests/test_eval_harness.py`, es que la lógica de scoring en sí es correcta: `extract_numbers`/`check_groundedness` están testeadas contra casos armados a mano (una respuesta anclada, un número inventado, sin llamadas a tools), y `run_eval` está testeado contra respuestas mockeadas tanto para una selección de tool correcta como incorrecta. Corré el harness con una key real para obtener números reales.
 
 ## Instalación
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate       # Windows PowerShell: .venv\Scripts\Activate.ps1
+.venv\Scripts\activate       # PowerShell: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
 ## Uso
 
-1. **Generar los datos sintéticos y entrenar el modelo de riesgo:**
-
-   ```bash
-   python -m src.setup_data
-   ```
-
-   Escribe `data/ops.duckdb` y `data/credit_risk_model.joblib`.
-
-2. **Generar las figuras de resultados y el resumen de métricas:**
-
-   ```bash
-   python -m src.generate_report
-   ```
-
-   Escribe `reports/figures/*.png`, `reports/figures/*.gif`, `reports/metrics.json`, y `outputs/interactive/credit_risk_scores.html`.
-
-3. **Correr la suite de tests** (funciona completamente offline, sin API key):
+1. **Herramientas y tests** funcionan desde un clon limpio (el almacén está versionado):
 
    ```bash
    pytest
+   python -m src.generate_report     # figuras + reports/metrics.json
    ```
 
-4. **Hablar con el agente** (requiere una `OPENAI_API_KEY` real):
+2. **Reconstruir el almacén desde los datos crudos** (unos 900 MB de descargas en `data/raw/`; la parte de Kaggle requiere `~/.kaggle/kaggle.json`):
 
    ```bash
-   # Una sola pregunta, sin estado:
-   python -m src.cli "¿Cuál fue la recuperación de flotación en septiembre de 2025?"
-
-   # Interactivo, multi-turno (recuerda el contexto entre preguntas hasta que escribís 'reset'):
-   python -m src.cli
+   python -m src.sources
+   python -m src.setup_data
    ```
 
-   Sin una key configurada, ambos modos terminan con un mensaje claro en vez de un traceback.
-
-5. **Correr el harness de evaluación** (también requiere una `OPENAI_API_KEY` real — ver [Harness de evaluación](#harness-de-evaluación-el-agente-elige-la-tool-correcta-y-se-mantiene-anclado-a-datos-reales) arriba):
+3. **Hablar con el agente** con un modelo local, sin clave:
 
    ```bash
-   python -m src.eval_harness
+   pip install "llama-cpp-python[server]==0.3.2" --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+   python -m llama_cpp.server --model qwen2.5-3b-instruct-q4_k_m.gguf --model_alias local --port 8011
+   # PowerShell: $env:LOCAL_LLM_BASE_URL = "http://localhost:8011/v1"
+   python -m src.cli "¿Cómo estuvo la sílice en el concentrado en junio de 2017?"
    ```
 
-## Decisión de diseño: versionar los datos generados
+   O define `OPENAI_API_KEY` para usar OpenAI.
 
-`data/ops.duckdb`, `data/credit_risk_model.joblib`, `reports/figures/*.png` + `reports/metrics.json`, y `outputs/interactive/credit_risk_scores.html` se versionan en el repo en vez de ignorarse. Son pequeños, sintéticos/derivados, regenerables de forma determinística (`python -m src.setup_data && python -m src.generate_report`), y versionarlos permite que las tools (y los resultados de arriba) sean visibles inmediatamente después de clonar el repo sin un paso de setup obligatorio. El `.gitignore` sigue excluyendo el entorno virtual y las cachés.
+4. **Correr la evaluación** (100 consultas; `--rescore` recalcula el puntaje de una corrida guardada sin llamar al modelo):
+
+   ```bash
+   python -m src.eval_harness --base-url http://localhost:8011/v1 --model local --parse-tool-calls \
+       --output reports/eval_local_qwen2.5-3b.json
+   ```
+
+## Limitaciones
+
+- La planta es una planta anónima de mineral de hierro (los datos de Kaggle no la nombran), no una planta chilena de cobre. Las compras son de compradores públicos chilenos, no las compras propias de una minera: Codelco y las mineras privadas no compran por Mercado Público.
+- No hay recuperación: el dataset no trae ley de relave, así que la recuperación metalúrgica no se puede calcular.
+- La detección de eventos es una regla (valores idénticos durante una hora o más), no una bitácora de mantención. Un tag que un operador fija a propósito también cuenta como congelado.
+- Un solo modelo local de un solo tamaño. Los resultados de modelos más grandes o en la nube pueden ser distintos, y el harness corre contra cualquier endpoint compatible con OpenAI para comprobarlo.
 
 ## Autor
 

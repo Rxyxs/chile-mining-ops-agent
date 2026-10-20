@@ -11,15 +11,12 @@ logic (extract_numbers, check_groundedness, run_eval) against small scripted
 mock clients, the same pattern tests/test_agent.py already uses, so it needs
 no live API key to prove the harness itself is correct.
 
-This module's own __main__ block, by contrast, needs a real OPENAI_API_KEY
--- it measures actual model behavior, which a mock client can't tell you
-anything true about. Run it with:
+This module's own __main__ block runs the 100 queries in `src/eval_queries.py`
+against a real model behind any OpenAI-compatible endpoint: OpenAI itself
+(`OPENAI_API_KEY`), or a local model served by llama-cpp-python, which needs no key:
 
-    OPENAI_API_KEY=sk-... python -m src.eval_harness
-
-No live key was available on the machine this harness was built on, so no
-real accuracy numbers are claimed anywhere in this repo's README for it --
-only that the harness exists and is ready to run.
+    python -m src.eval_harness --base-url http://localhost:8000/v1 --model local \
+        --output reports/eval_local.json
 """
 from __future__ import annotations
 
@@ -38,48 +35,9 @@ from src.tools import TOOL_REGISTRY, TOOL_SCHEMAS
 _NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)*")
 
 
-@dataclass(frozen=True)
-class EvalQuery:
-    query: str
-    expected_tools: tuple[str, ...]
-    note: str = ""
+from src.eval_queries import EVAL_QUERIES, EvalQuery  # noqa: E402,F401 -- re-exported
 
-
-EVAL_QUERIES: tuple[EvalQuery, ...] = (
-    EvalQuery(
-        "Cual fue el resumen de flotacion de septiembre 2025?",
-        ("get_flotation_summary",),
-    ),
-    EvalQuery(
-        "Hay alertas de mantenimiento en los ultimos 7 dias?",
-        ("get_maintenance_alerts",),
-    ),
-    EvalQuery(
-        "Dame el resumen de compras entregadas este trimestre.",
-        ("get_procurement_summary",),
-    ),
-    EvalQuery(
-        "Un cliente de 34 anos, ingreso mensual 850000 CLP, deuda sobre ingreso 0.4, "
-        "11 meses en su empleo actual, 1 pago atrasado, pide 2000000 CLP. Que tan "
-        "riesgoso es?",
-        ("score_credit_risk",),
-    ),
-    EvalQuery(
-        "Algun equipo muestra un patron de mantenimiento anomalo en los ultimos 60 dias?",
-        ("check_maintenance_anomalies",),
-    ),
-    EvalQuery(
-        "Dame el resumen de flotacion de agosto 2025 y dime si hay alertas de "
-        "mantenimiento activas.",
-        ("get_flotation_summary", "get_maintenance_alerts"),
-        note="multi-tool query -- both must fire",
-    ),
-    EvalQuery(
-        "Cual es la capital de Peru?",
-        (),
-        note="out-of-scope for every tool here -- none should fire",
-    ),
-)
+Z_95 = 1.959963985
 
 
 def extract_numbers(text: str) -> set[str]:
@@ -91,26 +49,83 @@ def extract_numbers(text: str) -> set[str]:
     return set(_NUMBER_RE.findall(text))
 
 
-def check_groundedness(answer_text: str, tool_calls: list[dict]) -> dict:
-    """Every number in the final answer should also appear somewhere in the
-    JSON of some tool call's result -- if not, the model may have invented
-    it rather than reading it off a real tool result. This is a heuristic,
-    not a proof: a model that echoes a number from the user's own question
-    (and that number happens not to also appear in any tool result) would be
-    flagged as a false positive here. Most of this repo's tools happen to
-    echo their own inputs back in the result (e.g. score_credit_risk's
-    `input_profile`), which covers the common case, but it's not guaranteed
-    for every tool."""
+def wilson_ci(successes: int, n: int, z: float = Z_95) -> tuple[float, float]:
+    """95% Wilson interval for a proportion (stays inside [0, 1] near the edges)."""
+    if n == 0:
+        return (0.0, 0.0)
+    phat = successes / n
+    denom = 1 + z**2 / n
+    center = phat + z**2 / (2 * n)
+    margin = z * ((phat * (1 - phat) / n + z**2 / (4 * n**2)) ** 0.5)
+    return (round(max(0.0, (center - margin) / denom), 4), round(min(1.0, (center + margin) / denom), 4))
+
+
+def check_arguments(expected_args: dict, calls: list[dict]) -> bool:
+    """Every expected tool was called at least once with the expected argument values
+    (other arguments are free; a tool listed with `{}` must be called with no filter
+    among the expected ones, so nothing is checked beyond the call itself)."""
+    for tool, expected in expected_args.items():
+        matching = [c for c in calls if c["tool"] == tool]
+        if not any(all(c["input"].get(k) == v for k, v in expected.items()) for c in matching):
+            return False
+    return True
+
+
+def _number_values(token: str) -> set[float]:
+    """Every value a formatted number could mean: '83,678' and '83.678' are 83678 in
+    a Spanish or English answer, '64,85' is 64.85, '6.514.323,484' is 6514323.484."""
+    values = set()
+    for decimal, thousands in ((".", ","), (",", ".")):
+        parts = token.split(decimal)
+        if len(parts) > 2:
+            continue
+        whole = parts[0].replace(thousands, "")
+        if thousands in parts[0] and not all(len(g) == 3 for g in parts[0].split(thousands)[1:]):
+            continue
+        try:
+            values.add(float(whole + ("." + parts[1] if len(parts) == 2 else "")))
+        except ValueError:
+            pass
+    # A bare '83,678' could also be 83.678 with a decimal comma.
+    if token.count(",") == 1 and "." not in token:
+        values.add(float(token.replace(",", ".")))
+    return values
+
+
+def _matches(value: float, sources: set[float]) -> bool:
+    """Equal, or equal once the source is rounded to the answer's precision."""
+    for source in sources:
+        if source == value:
+            return True
+        for digits in range(0, 4):
+            if round(source, digits) == value:
+                return True
+    return False
+
+
+def check_groundedness(
+    answer_text: str, tool_calls: list[dict], question: str = "", context: str = ""
+) -> dict:
+    """Every number in the final answer should also appear in some tool call's
+    result -- if not, the model may have invented it. Numbers are compared by
+    value, not as strings, so '83,678' matches a result of 83678.0 and '2.05'
+    matches 2.045 rounded. Numbers from the user's question and from `context`
+    (the tool descriptions, e.g. the 4.14% high-silica cut) count as sources too.
+    It checks numbers, not labels: an answer that calls 720 hours "720 days" passes."""
     answer_numbers = extract_numbers(answer_text)
     tool_blob = " ".join(json.dumps(c["result"], default=str) for c in tool_calls)
-    tool_numbers = extract_numbers(tool_blob)
+    source_tokens = extract_numbers(tool_blob) | extract_numbers(question) | extract_numbers(context)
+    source_values = {v for t in source_tokens for v in _number_values(t)}
 
-    ungrounded = {n for n in answer_numbers if n not in tool_numbers}
+    ungrounded = {n for n in answer_numbers if not any(_matches(v, source_values) for v in _number_values(n))}
     return {
         "answer_numbers": sorted(answer_numbers),
         "ungrounded_numbers": sorted(ungrounded),
         "is_grounded": not ungrounded,
     }
+
+
+TOOL_CONTEXT = " ".join(json.dumps(s_["function"], ensure_ascii=False) for s_ in TOOL_SCHEMAS)
 
 
 def _tracing_registry(base_registry: dict[str, Callable[..., Any]]) -> tuple[dict, list[dict]]:
@@ -121,7 +136,11 @@ def _tracing_registry(base_registry: dict[str, Callable[..., Any]]) -> tuple[dic
 
     def _wrap(name: str, func: Callable[..., Any]) -> Callable[..., Any]:
         def wrapped(**kwargs: Any) -> Any:
-            result = func(**kwargs)
+            try:
+                result = func(**kwargs)
+            except Exception as exc:
+                calls.append({"tool": name, "input": kwargs, "result": {"error": str(exc)}})
+                raise
             calls.append({"tool": name, "input": kwargs, "result": result})
             return result
 
@@ -130,65 +149,146 @@ def _tracing_registry(base_registry: dict[str, Callable[..., Any]]) -> tuple[dic
     return {name: _wrap(name, func) for name, func in base_registry.items()}, calls
 
 
-def run_eval(client: Any, eval_queries: tuple[EvalQuery, ...] = EVAL_QUERIES) -> dict:
+def run_eval(
+    client: Any, eval_queries: tuple[EvalQuery, ...] = EVAL_QUERIES, model: str | None = None,
+    progress: bool = False,
+) -> dict:
     """Runs every query in `eval_queries` against a fresh agent (one per
     query, so no cross-query state leaks), using the real tools from
     src/tools -- only the model client is swappable, so this can run
     against either a real `openai.OpenAI()` client or a scripted mock.
     Returns per-query results plus aggregate tool-selection accuracy and
     groundedness rate."""
-    results = []
-    for eq in eval_queries:
+    replay = []
+    for i, eq in enumerate(eval_queries):
         registry, calls = _tracing_registry(TOOL_REGISTRY)
-        agent = MiningOpsAgent(client=client, tool_registry=registry, tool_schemas=TOOL_SCHEMAS)
-        answer = agent.run(eq.query)
+        kwargs = {"model": model} if model else {}
+        agent = MiningOpsAgent(client=client, tool_registry=registry, tool_schemas=TOOL_SCHEMAS, **kwargs)
+        try:
+            answer = agent.run(eq.query)
+        except Exception as exc:  # noqa: BLE001 -- a server error is a result, not a crash
+            answer = f"[error] {type(exc).__name__}: {exc}"
+        replay.append((eq, answer, calls))
+        if progress:
+            r = _score(eq, answer, calls)
+            print(f"[{i + 1:>3}/{len(eval_queries)}] tools={r['actual_tools']} ok={r['tool_selection_correct']} "
+                  f"args={r['arguments_correct']} grounded={r['is_grounded']}", flush=True)
+    return _summarize(replay)
 
-        actual_tools = tuple(dict.fromkeys(c["tool"] for c in calls))
-        tool_selection_correct = set(actual_tools) == set(eq.expected_tools)
-        groundedness = check_groundedness(answer, calls)
 
-        results.append(
-            {
-                "query": eq.query,
-                "note": eq.note,
-                "expected_tools": list(eq.expected_tools),
-                "actual_tools": list(actual_tools),
-                "tool_selection_correct": tool_selection_correct,
-                "answer": answer,
-                **groundedness,
-            }
-        )
+def _score(eq: EvalQuery, answer: str, calls: list[dict]) -> dict:
+    actual_tools = tuple(dict.fromkeys(c["tool"] for c in calls))
+    tool_selection_correct = set(actual_tools) == set(eq.expected_tools)
+    arguments_correct = tool_selection_correct and check_arguments(eq.expected_args, calls)
+    return {
+        "query": eq.query,
+        "note": eq.note,
+        "expected_tools": list(eq.expected_tools),
+        "actual_tools": list(actual_tools),
+        "tool_selection_correct": tool_selection_correct,
+        "arguments_correct": arguments_correct,
+        "tool_calls": [{"tool": c["tool"], "input": c["input"]} for c in calls],
+        "answer": answer,
+        **check_groundedness(answer, calls, eq.query, TOOL_CONTEXT),
+    }
 
+
+def _summarize(replay: list[tuple[EvalQuery, str, list[dict]]]) -> dict:
+    results = [_score(eq, answer, calls) for eq, answer, calls in replay]
     n = len(results)
-    tool_selection_accuracy = (sum(r["tool_selection_correct"] for r in results) / n) if n else 0.0
-    groundedness_rate = (sum(r["is_grounded"] for r in results) / n) if n else 0.0
+    tool_hits = sum(r["tool_selection_correct"] for r in results)
+    arg_hits = sum(r["arguments_correct"] for r in results)
+    grounded = sum(r["is_grounded"] for r in results)
+
+    by_group: dict[str, dict] = {}
+    for (eq, _, _), r in zip(replay, results):
+        group = "out_of_scope" if not eq.expected_tools else (
+            "multi_tool" if len(eq.expected_tools) > 1 else eq.expected_tools[0])
+        g = by_group.setdefault(group, {"n": 0, "tool_selection": 0, "arguments": 0, "grounded": 0})
+        g["n"] += 1
+        g["tool_selection"] += int(r["tool_selection_correct"])
+        g["arguments"] += int(r["arguments_correct"])
+        g["grounded"] += int(r["is_grounded"])
 
     return {
         "n_queries": n,
-        "tool_selection_accuracy": round(tool_selection_accuracy, 4),
-        "groundedness_rate": round(groundedness_rate, 4),
+        "tool_selection_accuracy": round(tool_hits / n, 4) if n else 0.0,
+        "tool_selection_ci_95": list(wilson_ci(tool_hits, n)),
+        "arguments_accuracy": round(arg_hits / n, 4) if n else 0.0,
+        "arguments_ci_95": list(wilson_ci(arg_hits, n)),
+        "groundedness_rate": round(grounded / n, 4) if n else 0.0,
+        "groundedness_ci_95": list(wilson_ci(grounded, n)),
+        "by_group": by_group,
         "results": results,
     }
 
 
+def rescore(path: str) -> dict:
+    """Recomputes the scores of a saved run without calling the model again: the logged
+    tool calls are re-executed (the tools are deterministic) to recover their results."""
+    with open(path, encoding="utf-8") as f:
+        saved = json.load(f)
+    by_query = {q.query: q for q in EVAL_QUERIES}
+    replay = []
+    for r in saved["results"]:
+        calls = []
+        for c in r["tool_calls"]:
+            try:
+                result = TOOL_REGISTRY[c["tool"]](**c["input"])
+            except Exception as exc:  # noqa: BLE001
+                result = {"error": str(exc)}
+            calls.append({"tool": c["tool"], "input": c["input"], "result": result})
+        replay.append((by_query[r["query"]], r["answer"], calls))
+    return _summarize(replay)
+
+
 if __name__ == "__main__":
+    import argparse
     import os
     import sys
+    import time
+
+    parser = argparse.ArgumentParser(description="Runs the 100 eval queries against a real model.")
+    parser.add_argument("--base-url", default=None, help="OpenAI-compatible endpoint, e.g. http://localhost:8000/v1")
+    parser.add_argument("--model", default=None, help="Model name sent to the endpoint.")
+    parser.add_argument("--output", default=None, help="Where to write the JSON summary.")
+    parser.add_argument("--rescore", default=None, help="Re-score a saved run (no model call) and overwrite it.")
+    parser.add_argument("--parse-tool-calls", action="store_true",
+                        help="Parse <tool_call> blocks from content (local Qwen via llama-cpp, see src/local_client.py).")
+    args = parser.parse_args()
+
+    if args.rescore:
+        with open(args.rescore, encoding="utf-8") as f:
+            saved = json.load(f)
+        summary = {**rescore(args.rescore), "model": saved.get("model"), "elapsed_seconds": saved.get("elapsed_seconds")}
+        with open(args.rescore, "w", encoding="utf-8") as f:
+            f.write(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+        print(json.dumps({k: v for k, v in summary.items() if k != "results"}, indent=2, ensure_ascii=False))
+        raise SystemExit(0)
 
     api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
+    if args.base_url is None and not api_key:
         print(
-            "OPENAI_API_KEY is not set. This harness measures real model "
-            "behavior and refuses to fabricate numbers by running against a "
-            "mock client instead -- see tests/test_eval_harness.py for a "
-            "mocked demonstration of the scoring logic itself, which is not "
-            "the same thing as a real accuracy measurement.",
+            "Set OPENAI_API_KEY, or pass --base-url for a local OpenAI-compatible server. "
+            "This harness measures real model behavior and never falls back to a mock.",
             file=sys.stderr,
         )
         raise SystemExit(1)
 
     import openai
 
-    real_client = openai.OpenAI(api_key=api_key)
-    summary = run_eval(real_client)
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    real_client = openai.OpenAI(api_key=api_key or "not-needed", base_url=args.base_url, timeout=600)
+    if args.parse_tool_calls:
+        from src.local_client import ToolCallParsingClient
+
+        real_client = ToolCallParsingClient(real_client)
+    start = time.perf_counter()
+    summary = run_eval(real_client, model=args.model, progress=True)
+    summary["model"] = args.model
+    summary["elapsed_seconds"] = round(time.perf_counter() - start, 1)
+    text = json.dumps(summary, indent=2, ensure_ascii=False)
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+    print(json.dumps({k: v for k, v in summary.items() if k != "results"}, indent=2, ensure_ascii=False))
+
