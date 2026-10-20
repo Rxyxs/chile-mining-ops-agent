@@ -1,6 +1,6 @@
 # Chile Mining Ops Agent
 
-*[Versión en español: README.es.md](README.es.md)*
+[English ] | [[Español](README.es.md) ]
 
 [![tests](https://github.com/Rxyxs/chile-mining-ops-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/Rxyxs/chile-mining-ops-agent/actions/workflows/tests.yml)
 
