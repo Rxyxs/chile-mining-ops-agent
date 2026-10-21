@@ -9,3 +9,6 @@ __pycache__/
 # which was making GitHub misdetect the repo's primary language as HTML instead
 # of the real code. Regenerate locally from its source script.
 outputs/interactive/
+
+# Raw downloads (rebuild with python -m src.sources)
+data/raw/

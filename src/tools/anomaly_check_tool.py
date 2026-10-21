@@ -1,6 +1,6 @@
-"""Anomaly detection tool over the synthetic operations warehouse.
+"""Anomaly detection tool over the operations warehouse (real plant events).
 
-Runs an Isolation Forest over recent maintenance/downtime data to flag
+Runs an Isolation Forest over recent equipment/instrument events to flag
 statistically unusual equipment behavior (e.g. abnormal downtime spikes).
 """
 from __future__ import annotations
@@ -41,12 +41,12 @@ def check_maintenance_anomalies(
 
     con = _connect(db_path)
     try:
-        max_date = con.execute("SELECT MAX(date) FROM maintenance_events").fetchone()[0]
+        max_date = con.execute("SELECT MAX(date) FROM flotation_daily").fetchone()[0]
         df = con.execute(
             """
             SELECT equipment_id, event_type, severity, downtime_hours
             FROM maintenance_events
-            WHERE CAST(date AS DATE) >= CAST(? AS DATE) - CAST(? AS INTEGER)
+            WHERE CAST(date AS DATE) > CAST(? AS DATE) - CAST(? AS INTEGER)
             """,
             [max_date, days],
         ).fetchdf()

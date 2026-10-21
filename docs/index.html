@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Chile Mining Ops Agent</title>
-<meta name="description" content="*[Version en español: README.es.md](README.es.md)*">
+<meta name="description" content="A tool-calling agent over real mining data, measured on 100 queries with a local Qwen2.5-3B model.">
 <style>
   :root { --bg:#FBFAF8; --surface:#FFF; --ink:#23201D; --muted:#6B645D; --line:#E3DED7; --accent:#B5553D; }
   @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
@@ -30,6 +30,9 @@
   p { margin:0 0 16px; max-width:70ch; }
   code { background:var(--surface); border:1px solid var(--line); border-radius:4px; padding:1px 5px; font-size:.86em;
     font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }
+  table { border-collapse:collapse; margin:14px 0 22px; font-size:.92rem; width:100%; }
+  th, td { border-bottom:1px solid var(--line); padding:7px 9px; text-align:left; }
+  td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
   footer { margin-top:60px; padding-top:22px; border-top:1px solid var(--line); font-size:.86rem; color:var(--muted); }
   a { color:var(--accent); }
 </style>
@@ -38,33 +41,33 @@
 <div class="wrap">
 <header>
 <h1>Chile Mining Ops Agent</h1>
-<p class="lede">*[Version en español: README.es.md](README.es.md)*</p>
+<p class="lede">A tool-calling agent over <strong>real public mining data</strong> (a flotation plant, its instrument events, and Chilean public procurement), measured on <strong>100 labeled queries</strong> with Qwen2.5-3B running locally on CPU.</p>
 <div class="links">
 <a href="https://github.com/Rxyxs/chile-mining-ops-agent">Code and method</a>
-<a href="https://github.com/Rxyxs/chile-mining-ops-agent#readme">Full README</a>
+<a href="https://github.com/Rxyxs/chile-mining-ops-agent/blob/main/README.es.md">Leer en español</a>
 </div></header>
-<p>This page shows the project's results. The methodology, the design decisions and the limitations are documented in the repository's README.</p>
-<h2>`score_credit_risk` — weak, and now verified to be near-optimal, not just &quot;honest&quot;</h2>
+<p>This page shows the results. The methodology, the design decisions and the limitations are in the repository's README.</p>
+<h2>The agent picks the right tool; copying the numbers is the hard part</h2>
+<table>
+<tr><th></th><th class="n">Amounts in pesos</th><th class="n">Amounts in millions of CLP</th></tr>
+<tr><td>Correct tools</td><td class="n">99/100</td><td class="n">99/100</td></tr>
+<tr><td>Correct arguments</td><td class="n">95/100</td><td class="n">96/100</td></tr>
+<tr><td>Grounded answers</td><td class="n">67/100</td><td class="n"><strong>86/100</strong></td></tr>
+<tr><td>… procurement queries</td><td class="n">4/25</td><td class="n"><strong>19/25</strong></td></tr>
+</table>
+<p>With raw pesos the model miscopied amounts in 21 of 25 procurement answers (×10 slips, misplaced separators). Returning the same amounts in millions of CLP fixed most of them without touching the model. Two failures no number check catches remain: for months with no data it silently answers about another month, and it sometimes reports hours as days.</p>
+<h2>The Isolation Forest misses the worst sensors</h2>
 <figure>
-<img src="figures/credit_risk_evaluation.png" alt="Credit risk evaluation" loading="lazy">
-<figcaption>Three panels, all from the same held-out test set (n=400): the ROC curve (left) hugs the no-skill diagonal — it never gets far above it, which is what a ROC-AUC of 0.586 looks like when you actually plot it instead of just reporting the number. The PR curve (center) spikes near recall=0 (a handful of confident, correct high-probability predictions) and then decays fast toward the 0.245 base rate, which is the realistic floor once recall increases. The histogram (right) makes the reason visible: the predicted-probability distributions for &quot;default&quot; and &quot;no default&quot; overlap almost completely.</figcaption>
+<img src="figures/anomaly_scores.png" alt="Event hours by equipment, last 200 days of plant data" loading="lazy">
+<figcaption>The air-flow instruments of columns 04 and 05 were frozen for 460 hours, the worst events in the data, and are not flagged. With 11 equipment items and contamination 0.1 the forest flags one, and two identical outliers make each other look normal. A rule of "any event over 24 hours" finds both.</figcaption>
+</figure>
+<h2>Flotation and procurement</h2>
+<figure>
+<img src="figures/warehouse_overview.png" alt="Monthly silica in concentrate and public procurement by category" loading="lazy">
+<figcaption>Silica in concentrate fell from 2.64% in April to 2.05% in June and July, and rose to 2.68% in the partial September. Fuels and lubricants (38.7 billion CLP) and industrial chemicals (29.8 billion) dwarf mining machinery and mining drilling services.</figcaption>
 </figure>
 <figure>
-<img src="figures/ceiling_comparison.png" alt="Ceiling comparison" loading="lazy">
-</figure>
-<h2>`check_maintenance_anomalies` — downtime isn&#x27;t the whole story</h2>
-<figure>
-<img src="figures/anomaly_scores.png" alt="Anomaly scores by equipment" loading="lazy">
-<figcaption>3 of 24 pieces of equipment get flagged by the <code>IsolationForest</code>, and the flagged ones are <strong>not</strong> simply the three with the most downtime — that&#x27;s the interesting part of this chart. EQ-007 has more total downtime (23.2h) than the flagged EQ-009 (22.6h) but isn&#x27;t flagged; EQ-023 gets flagged at a mid-range 10.4h, well below several normal bars; and EQ-024 is flagged despite having almost no downtime at all (0.5h) — anomalous for being unusually *low*, not high. That&#x27;s expected from an Isolation Forest run over multiple maintenance-event features (frequency, severity, downtime) rather than a single downtime threshold, and it&#x27;s a more realistic signal than &quot;flag whatever has the biggest bar.&quot;</figcaption>
-</figure>
-<h2>`get_flotation_summary` / `get_procurement_summary` — the operational backdrop</h2>
-<figure>
-<img src="figures/warehouse_overview_animated.gif" alt="Warehouse overview animated" loading="lazy">
-<figcaption>The GIF above animates the flotation recovery trend across the 12 months; the PNG below is the static reference for detailed reading.</figcaption>
-</figure>
-<figure>
-<img src="figures/warehouse_overview.png" alt="Warehouse overview" loading="lazy">
-<figcaption>The GIF above animates the flotation recovery trend across the 12 months; the PNG below is the static reference for detailed reading.</figcaption>
+<img src="figures/warehouse_overview_animated.gif" alt="Monthly silica in concentrate, animated" loading="lazy">
 </figure>
 <footer>
 Pablo Reyes · <a href="https://github.com/Rxyxs/chile-mining-ops-agent">github.com/Rxyxs/chile-mining-ops-agent</a> · MIT<br><br>

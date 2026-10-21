@@ -16,5 +16,5 @@ def test_generate_report_writes_metrics_json_with_expected_keys():
         on_disk = json.load(f)
     assert on_disk == summary
 
-    for key in ("credit_risk_tool", "anomaly_check_tool", "warehouse_query_tool"):
+    for key in ("anomaly_check_tool", "warehouse_query_tool"):
         assert key in summary

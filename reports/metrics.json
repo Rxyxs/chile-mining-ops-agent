@@ -1,25 +1,23 @@
 {
-  "credit_risk_tool": {
-    "roc_auc": 0.5861,
-    "pr_auc": 0.3351,
-    "test_accuracy": 0.755,
-    "n_test": 400,
-    "base_rate": 0.245
-  },
-  "credit_risk_ceiling_check": {
-    "oracle_auc": 0.6108,
-    "logistic_regression_auc": 0.5861,
-    "gradient_boosting_auc": 0.6069,
-    "logistic_ceiling_capture_pct": 96.0,
-    "gbm_ceiling_capture_pct": 99.4
-  },
   "anomaly_check_tool": {
-    "window_days": 60,
-    "n_equipment_evaluated": 24,
-    "n_equipment_flagged": 3
+    "window_days": 200,
+    "n_equipment_evaluated": 11,
+    "n_equipment_flagged": 1,
+    "flagged": [
+      "plant_historian"
+    ]
   },
   "warehouse_query_tool": {
-    "n_months": 12,
-    "n_procurement_categories": 5
+    "n_months": 7,
+    "n_procurement_categories": 4,
+    "avg_silica_concentrate_pct_by_month": {
+      "2017-03": 2.45,
+      "2017-04": 2.64,
+      "2017-05": 2.49,
+      "2017-06": 2.05,
+      "2017-07": 2.05,
+      "2017-08": 2.25,
+      "2017-09": 2.68
+    }
   }
 }
